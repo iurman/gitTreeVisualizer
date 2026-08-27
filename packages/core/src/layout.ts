@@ -63,7 +63,7 @@ export function defaultLayoutOptions(tree: TreeStructure): LayoutOptions {
     ringUnit: autoRingUnit(window),
     window,
     height: 100,
-    spread: 62,
+    spread: 86,
     limbSegments: 22,
   };
 }
@@ -284,11 +284,16 @@ function buildSkeletons(
 
     const timeRise = (tipH - baseH) * (H - baseY);
     // A branch opened and merged inside an hour still has to be a visible
-    // branch, so length also derives from how much work is on it.
-    const minRise = H * 0.02 * Math.sqrt(n);
+    // branch, so length also derives from how much work is on it. Without this
+    // floor a repository whose branches are all short-lived renders as a pole.
+    const minRise = Math.min(H * 0.45, H * 0.1 * Math.sqrt(n));
     const churnBoost = churnWeighted ? 0.6 + 1.1 * Math.sqrt(churnOf(limb.id) / maxChurn) : 1;
-    const rise = Math.max(timeRise, minRise) * churnBoost;
-    const lateral = Math.min(rise * Math.tan(alpha), opts.spread * 0.5) * lerp(1, 1.18, theta2d);
+    // Deeper limbs are shorter, the way a twig is shorter than the bough it grew from.
+    const depthFade = Math.max(0.42, 1 - 0.14 * (limb.depth - 1));
+    const rise = Math.max(timeRise, minRise) * churnBoost * depthFade;
+    const lateral =
+      Math.min(Math.max(rise * Math.tan(alpha), H * 0.07 * depthFade), opts.spread * 0.5) *
+      lerp(1, 1.18, theta2d);
 
     const outward: Vec3 = [Math.cos(theta), 0, Math.sin(theta) * (1 - theta2d * 0.94)];
     const perp: Vec3 = normalize(cross(outward, [0, 1, 0]));
@@ -393,6 +398,8 @@ export function layout(tree: TreeStructure, mode: LayoutMode, optsIn: LayoutOpti
 
   const leafPositions = new Float32Array(leafCount * 3);
   const leafScales = new Float32Array(leafCount);
+  const leafSizes = new Float32Array(leafCount);
+  const leafHeights = new Float32Array(leafCount);
   const limbVertices = new Float32Array(slots * S * LIMB_RING_VERTS * 3);
   const limbRadii = new Float32Array(slots * S);
   const limbVisible = new Float32Array(slots);
@@ -401,6 +408,8 @@ export function layout(tree: TreeStructure, mode: LayoutMode, optsIn: LayoutOpti
     return {
       leafPositions,
       leafScales,
+      leafSizes,
+      leafHeights,
       limbVertices,
       limbRadii,
       limbVisible,
@@ -429,11 +438,11 @@ export function layout(tree: TreeStructure, mode: LayoutMode, optsIn: LayoutOpti
   const bounds = newBounds();
 
   if (mode === 'timeline') {
-    layoutTimeline(tree, opts, scale, { leafPositions, leafScales, limbVertices, limbRadii, limbVisible }, S, slots, churnMax, bounds);
+    layoutTimeline(tree, opts, scale, { leafPositions, leafScales, leafSizes, leafHeights, limbVertices, limbRadii, limbVisible }, S, slots, churnMax, bounds);
   } else if (mode === 'byAuthor') {
-    layoutByAuthor(tree, opts, scale, { leafPositions, leafScales, limbVertices, limbRadii, limbVisible }, S, slots, churnMax, bounds);
+    layoutByAuthor(tree, opts, scale, { leafPositions, leafScales, leafSizes, leafHeights, limbVertices, limbRadii, limbVisible }, S, slots, churnMax, bounds);
   } else {
-    layoutTree(tree, opts, scale, mode, { leafPositions, leafScales, limbVertices, limbRadii, limbVisible }, S, slots, churnMax, bounds);
+    layoutTree(tree, opts, scale, mode, { leafPositions, leafScales, leafSizes, leafHeights, limbVertices, limbRadii, limbVisible }, S, slots, churnMax, bounds);
   }
 
   const rings: RingMark[] = mode === 'byAuthor' ? [] : ringMarks(scale, opts.ringUnit);
@@ -441,6 +450,8 @@ export function layout(tree: TreeStructure, mode: LayoutMode, optsIn: LayoutOpti
   return {
     leafPositions,
     leafScales,
+    leafSizes,
+    leafHeights,
     limbVertices,
     limbRadii,
     limbVisible,
@@ -454,6 +465,8 @@ export function layout(tree: TreeStructure, mode: LayoutMode, optsIn: LayoutOpti
 type Buffers = {
   leafPositions: Float32Array;
   leafScales: Float32Array;
+  leafSizes: Float32Array;
+  leafHeights: Float32Array;
   limbVertices: Float32Array;
   limbRadii: Float32Array;
   limbVisible: Float32Array;
@@ -462,7 +475,7 @@ type Buffers = {
 function leafScaleFor(tree: TreeStructure, oid: string, churnMax: number): number {
   const node = tree.nodes.get(oid)!;
   const churn = node.commit.additions + node.commit.deletions;
-  let s = 0.55 + 1.15 * Math.sqrt(clamp(churn / churnMax, 0, 1));
+  let s = 0.95 + 1.9 * Math.sqrt(clamp(churn / churnMax, 0, 1));
   if (node.isMerge) s *= 1.35;
   if (node.synthetic) s *= 0.78;
   return s;
@@ -529,6 +542,8 @@ function layoutTree(
     const h = scale.height(node.time);
     const inWindow = node.time >= scale.window.start && node.time <= scale.window.end;
     const grown = h <= opts.growthCutoff + 1e-6;
+    buf.leafHeights[i] = h;
+    buf.leafSizes[i] = inWindow ? s : 0;
     buf.leafScales[i] = inWindow && grown ? s : 0;
     if (buf.leafScales[i] > 0) growBounds(bounds, [px, py, pz], s);
   }
@@ -644,6 +659,8 @@ function layoutByAuthor(
     buf.leafPositions[i * 3 + 1] = safe(py);
     buf.leafPositions[i * 3 + 2] = safe(pz);
     const inWindow = node.time >= scale.window.start && node.time <= scale.window.end;
+    buf.leafHeights[i] = h;
+    buf.leafSizes[i] = inWindow ? s : 0;
     buf.leafScales[i] = inWindow && h <= opts.growthCutoff + 1e-6 ? s : 0;
     if (buf.leafScales[i] > 0) growBounds(bounds, [px, py, pz], s);
   }
@@ -707,6 +724,8 @@ function layoutTimeline(
     buf.leafPositions[i * 3 + 1] = safe(py);
     buf.leafPositions[i * 3 + 2] = 0;
     const inWindow = node.time >= scale.window.start && node.time <= scale.window.end;
+    buf.leafHeights[i] = h;
+    buf.leafSizes[i] = inWindow ? s : 0;
     buf.leafScales[i] = inWindow && h <= opts.growthCutoff + 1e-6 ? s : 0;
     if (buf.leafScales[i] > 0) growBounds(bounds, [px, py, 0], s);
   }

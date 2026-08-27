@@ -8,3 +8,4 @@ export * from './search.js';
 export * from './directory.js';
 export * from './hash.js';
 export * from './vec.js';
+export * from './svg.js';

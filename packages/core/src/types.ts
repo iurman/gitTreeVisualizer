@@ -184,6 +184,15 @@ export type LayoutResult = {
   leafPositions: Float32Array;
   /** 1 float per commit. 0 means "not visible in this view". */
   leafScales: Float32Array;
+  /**
+   * Leaf size before the growth gate, window gate still applied. The renderer
+   * gates growth per-instance in the vertex shader against `leafHeights`, so a
+   * leaf appears at its exact moment rather than at the next worker keyframe.
+   * `leafScales` stays the gated value everything else reads.
+   */
+  leafSizes: Float32Array;
+  /** Normalized 0..1 height within the window, per commit. The growth clock. */
+  leafHeights: Float32Array;
   /** LIMB_RING_VERTS * limbSegments floats per limb. Fixed count, always. */
   limbVertices: Float32Array;
   /** One radius per limb vertex ring. */
