@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { HAZE, MORPH, PALETTE_LOOKUP, SNAP } from './shaders.js';
+import { LEAF_HEADROOM, LEAF_MAX_PX, LEAF_MIN_PX } from './leafSize.js';
 
 /* -------------------------------------------------------------------------- */
 /* Leaves                                                                      */
@@ -34,7 +35,8 @@ uniform vec2 uResolution;
 uniform float uGravity;
 uniform float uGroundY;
 uniform float uSway;
-uniform float uPixelUnit;
+uniform float uPixelScale;
+uniform vec3 uLeafRange;
 uniform float uSelected;
 uniform float uHovered;
 
@@ -84,10 +86,24 @@ void main() {
 
   vec4 mv = modelViewMatrix * vec4(p, 1.0);
   vDepth = -mv.z;
-  // Billboard, then quantize the size to whole low-resolution pixels so leaves
-  // never render as a half-lit smear.
-  float px = max(uPixelUnit, floor(s / uPixelUnit + 0.5) * uPixelUnit);
-  mv.xy += position.xy * px * (1.0 + vMark * 0.4);
+
+  // Billboard, sized in whole render-target pixels rather than whole world
+  // units. uPixelScale is how many world units one pixel spans at unit depth,
+  // so multiplying by this leaf's own depth gives the size of a pixel where the
+  // leaf actually is. Clamping that ratio is what stops a forty-commit
+  // repository drawing below one pixel and a fly-to filling the frame with one
+  // diamond; snapping it is what stops a leaf rendering as a half-lit smear.
+  float unit = max(1e-5, vDepth * uPixelScale);
+  float raw = (s * (1.0 + vMark * 0.4)) / unit;
+  // Identity below the ceiling, compressed into the headroom above it, so a
+  // bigger commit still reads as bigger in a close-up instead of every leaf
+  // saturating at the same size. This is leafPixels() in leafSize.ts, and the
+  // test asserts the two agree.
+  float over = max(0.0, raw / uLeafRange.y - 1.0);
+  float soft = uLeafRange.y * (1.0 + over / (1.0 + over / uLeafRange.z));
+  float sizePx = max(uLeafRange.x, floor(min(raw, soft) + 0.5)) * unit;
+  mv.xy += position.xy * sizePx;
+
   gl_Position = snapToGrid(projectionMatrix * mv, uResolution);
   if (s <= 0.0001) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
 }
@@ -190,7 +206,8 @@ export class LeafSystem {
         uGravity: { value: 9.4 },
         uGroundY: { value: 0 },
         uSway: { value: 0.22 },
-        uPixelUnit: { value: 0.35 },
+        uPixelScale: { value: 0.004 },
+        uLeafRange: { value: new THREE.Vector3(LEAF_MIN_PX, LEAF_MAX_PX, LEAF_HEADROOM) },
         uPalette: { value: palette },
         uDimColor: { value: dimColor },
         uSelected: { value: -1 },

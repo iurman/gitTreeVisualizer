@@ -188,10 +188,36 @@ rather than timing out.
 - Sound is muted persistently through `localStorage`, muted while the tab is
   hidden, and always has a visible toggle.
 - Narrow viewports open flat, with orbit as an opt-in. Audio works.
-- Without WebGL, a server-rendered SVG of the same tree is shown, not an error
-  screen.
 - Loading is progressive: the first commits render while the rest stream. There
   is no blocking spinner.
+
+---
+
+## Browsers
+
+The tree is drawn by [Three.js](https://threejs.org). Three's `WebGLRenderer`
+has been WebGL 2 only since r163, so the GPU path is WebGL 2: **Chrome 56+,
+Edge 79+, Firefox 51+, Safari 15+, and every Chromium browser including Brave
+and Opera.** That is over 97% of browsers in use. WebGPU was considered and
+rejected — it is not in Firefox on Linux, not in Safari before 26, and still
+flagged off on a good deal of hardware, so it would cost reach rather than add
+it.
+
+The rest is not old browsers. It is current ones with WebGL switched off:
+Firefox and Brave both do it under fingerprinting protection, an enterprise
+policy or a blocklisted driver does it on machines that are otherwise fine, and
+a virtual desktop often has no GPU to offer at all. Those get a **software
+renderer** — the same tree, the same twenty-four colours, the same 480×270
+pixel grid, rasterized on the CPU. Growth, orbit, every view, every lens,
+clicking a commit and the timeline all work; what it drops is the ambient sway
+on limbs and per-pixel lighting on the bark, neither of which is legible at two
+pixels wide. It needs nothing but a canvas. A badge says which renderer is
+running, and `?renderer=2d` forces the software one on a machine that has a GPU.
+
+If the browser takes the graphics context away mid-session — which phones do
+under memory pressure, and a driver reset does on the desktop — the tree comes
+back when the context does. If it does not come back, the software renderer
+takes over rather than leaving a frozen canvas.
 
 ---
 

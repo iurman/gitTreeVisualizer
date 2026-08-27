@@ -38,9 +38,11 @@ export function App() {
 }
 
 /**
- * What a browser without WebGL gets instead of an error screen. Brave and
- * Firefox both block WebGL under their fingerprinting protections, so this is
- * not a rare path, and the copy says what a reader can actually do about it.
+ * The last resort, and now genuinely last: it takes a browser that refuses both
+ * WebGL and 2D canvas drawing to reach this. A browser with only WebGL blocked
+ * — Brave and Firefox both do that under their fingerprinting protections —
+ * gets the software renderer instead, which is the whole product rather than a
+ * picture of it.
  */
 function Fallback() {
   const s = useViewerState();
@@ -59,9 +61,8 @@ function Fallback() {
         />
       )}
       <p className="caption">
-        WebGL is unavailable in this browser, so this is a flat drawing of the same tree, made on the server. If you
-        block fingerprinting or have hardware acceleration turned off, allowing WebGL for this site brings back the
-        growth animation.
+        This browser would not give the page a canvas to draw on at all, so this is a flat drawing of the same tree,
+        made on the server. Allowing canvas or WebGL for this site brings back the growth animation.
       </p>
     </div>
   );
@@ -85,7 +86,7 @@ function Shell({ onBack }: { onBack: () => void }) {
       {/* The fallback covers the canvas, so it must not also cover an error: if
           the repository could not be read there is no tree to draw flat, and
           the reason is the thing worth showing. */}
-      {s.webglFailed && s.repo && s.phase !== 'error' ? <Fallback /> : null}
+      {s.rendererFailed && s.repo && s.phase !== 'error' ? <Fallback /> : null}
 
       <header className="topbar">
         <a
@@ -128,7 +129,7 @@ function Shell({ onBack }: { onBack: () => void }) {
         </>
       ) : null}
 
-      {(s.phase === 'loading' || s.phase === 'seed') && !begun && !s.webglFailed ? (
+      {(s.phase === 'loading' || s.phase === 'seed') && !begun && !s.rendererFailed ? (
         <Seed
           onBegin={() => {
             setBegun(true);

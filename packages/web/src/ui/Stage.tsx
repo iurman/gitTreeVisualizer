@@ -30,7 +30,10 @@ export function Stage() {
       ro.disconnect();
       viewer.unmount();
     };
-  }, [viewer]);
+    // The generation changes when a renderer has to be swapped. A canvas can
+    // only ever hold one kind of context, so the swap needs a new element, and
+    // remounting through the normal path is how it gets one.
+  }, [viewer, s.rendererGeneration]);
 
   const ndc = (e: { clientX: number; clientY: number }) => {
     const el = canvasRef.current!;
@@ -41,6 +44,7 @@ export function Stage() {
   return (
     <div className="stage" ref={wrapRef}>
       <canvas
+        key={s.rendererGeneration}
         ref={canvasRef}
         tabIndex={0}
         aria-label="The repository, drawn as a tree. Use arrow keys to walk between commits."

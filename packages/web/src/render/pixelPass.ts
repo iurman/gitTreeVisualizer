@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { PALETTE_LINEAR } from '../palette.js';
+import { BASE_HEIGHT, BASE_WIDTH, targetSize } from './resolution.js';
 
 /* -------------------------------------------------------------------------- */
 /* The pixel pipeline                                                          */
@@ -12,9 +13,6 @@ import { PALETTE_LINEAR } from '../palette.js';
 /* state the native look rather than a degraded version of the three-          */
 /* dimensional one.                                                            */
 /* -------------------------------------------------------------------------- */
-
-export const BASE_WIDTH = 480;
-export const BASE_HEIGHT = 270;
 
 const VERT = /* glsl */ `
 varying vec2 vUv;
@@ -33,15 +31,26 @@ uniform vec2 uResolution;
 uniform float uDither;
 uniform float uVignette;
 
-// 4x4 Bayer. Ordered dither breaks the banding that any fixed palette produces
-// across a gradient, and it is the only kind of noise that stays still while
-// the camera moves, which matters when the whole point is stable pixels.
-const float bayer[16] = float[16](
-   0.0,  8.0,  2.0, 10.0,
-  12.0,  4.0, 14.0,  6.0,
-   3.0, 11.0,  1.0,  9.0,
-  15.0,  7.0, 13.0,  5.0
-);
+// 4x4 Bayer, evaluated rather than looked up. Ordered dither breaks the
+// banding that any fixed palette produces across a gradient, and it is the
+// only kind of noise that stays still while the camera moves, which matters
+// when the whole point is stable pixels.
+//
+// Written as arithmetic on purpose. A float[16](...) initializer is GLSL ES
+// 3.00 syntax and only compiled here because Three rewrites every
+// ShaderMaterial to '#version 300 es' behind our backs - an internal detail of
+// one library version, in the one file whose job is to be portable. This form
+// is valid under both shading languages and needs no uniform upload.
+float m2(float a, float b) {
+  return a * 2.0 + b * 3.0 - a * b * 4.0;
+}
+
+float bayer4(vec2 p) {
+  vec2 q = mod(floor(p), 4.0);
+  vec2 lo = mod(q, 2.0);
+  vec2 hi = floor(q * 0.5);
+  return 4.0 * m2(lo.x, lo.y) + m2(hi.x, hi.y);
+}
 
 vec3 toLinear(vec3 c) {
   return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c));
@@ -55,9 +64,7 @@ void main() {
   vec3 src = texture2D(uScene, vUv).rgb;
   vec3 lin = toLinear(src);
 
-  ivec2 px = ivec2(floor(vUv * uResolution));
-  int bi = (px.y - (px.y / 4) * 4) * 4 + (px.x - (px.x / 4) * 4);
-  float threshold = (bayer[bi] / 16.0) - 0.5;
+  float threshold = (bayer4(vUv * uResolution) / 16.0) - 0.5;
   lin += threshold * uDither;
 
   // Radial falloff toward the plate edge, applied before quantization so it
@@ -121,13 +128,9 @@ export class PixelPass {
     this.scene.add(this.quad);
   }
 
-  /**
-   * Aspect-adjusted low-resolution size. Width is fixed so pixel size stays
-   * constant across viewports; only the height follows the aspect ratio.
-   */
+  /** Aspect-adjusted low-resolution size, shared with the 2D backend. */
   resize(aspect: number, scale = 1): void {
-    const w = Math.max(64, Math.round(BASE_WIDTH * scale));
-    const h = Math.max(48, Math.round((w / Math.max(0.2, aspect)) / 2) * 2);
+    const [w, h] = targetSize(aspect, scale);
     if (w === this.width && h === this.height) return;
     this.width = w;
     this.height = h;

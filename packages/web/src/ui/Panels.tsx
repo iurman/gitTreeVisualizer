@@ -168,6 +168,26 @@ export function Badges() {
           No branch structure survives in this history. The skeleton is the file tree at HEAD; commits drive growth.
         </span>
       ) : null}
+      {s.contextLost ? (
+        <span className="badge mono warn" title="The browser took the graphics context away. Waiting for it to come back.">
+          gpu context lost
+        </span>
+      ) : null}
+      {/* Only worth saying when it is not the usual path. A reader on the
+          software renderer is usually one browser setting away from the fast
+          one, and the note is the only way they would ever find out. */}
+      {s.renderer === 'canvas2d' ? (
+        <span
+          className="badge mono"
+          title={
+            s.rendererNote
+              ? `Drawing on the CPU: ${s.rendererNote}. Allowing WebGL for this site restores the GPU renderer.`
+              : 'Drawing on the CPU.'
+          }
+        >
+          software renderer
+        </span>
+      ) : null}
     </div>
   );
 }
