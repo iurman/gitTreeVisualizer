@@ -140,8 +140,11 @@ export function Timeline() {
           onPointerDown={(e) => {
             setSnap(e.shiftKey);
             const f = posOf(e.clientX);
-            const inside = f >= winStart && f <= winEnd;
-            if (e.altKey || (inside && e.currentTarget === e.target && !windowed)) {
+            // Selecting a range is the primary action, so a plain drag brushes
+            // one. Alt-drag scrubs growth, and once a range exists, dragging
+            // inside it pans. This is the order the hint below promises.
+            const inside = windowed && f >= winStart && f <= winEnd;
+            if (e.altKey) {
               setDrag({ kind: 'scrub' });
               viewer.skipGrowth();
               viewer.setGrowth(f);

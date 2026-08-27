@@ -216,7 +216,9 @@ function labelFor(t: number, unit: RingUnit): string {
     case 'week':
       return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}`;
     case 'month':
-      return `${MONTHS[d.getUTCMonth()]} ${String(d.getUTCFullYear()).slice(2)}`;
+      // The apostrophe matters: "Jan 26" at month granularity would read as a
+      // day of the month, which is the neighbouring unit's label.
+      return `${MONTHS[d.getUTCMonth()]} ’${String(d.getUTCFullYear()).slice(2)}`;
     case 'year':
       return String(d.getUTCFullYear());
   }

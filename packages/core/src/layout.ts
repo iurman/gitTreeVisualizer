@@ -607,7 +607,7 @@ function layoutByAuthor(
     const alpha = hashRange(i + 1, 2, 38, 52) * DEG;
     const rise = Math.max((tipH - baseH) * H, H * 0.05 * Math.sqrt(s.count));
     const lateral = Math.min(rise * Math.tan(alpha), opts.spread * 0.55) * lerp(1, 1.18, theta2d);
-    const radius = H * TRUNK_RADIUS_FRAC * (0.35 + 0.9 * Math.sqrt(s.count / maxCount));
+    const radius = H * TRUNK_RADIUS_FRAC * 0.62 * (0.3 + 0.8 * Math.sqrt(s.count / maxCount));
     const geom: AuthorGeom = {
       base: [0, baseH * H, 0],
       outward: [Math.cos(theta), 0, Math.sin(theta) * (1 - theta2d * 0.94)],

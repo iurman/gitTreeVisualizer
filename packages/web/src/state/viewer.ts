@@ -775,6 +775,9 @@ export class Viewer {
     const r = this.renderer;
     return {
       mode: this.state.mode,
+      lens: this.state.lens,
+      ringUnit: this.state.ringUnit,
+      window: this.state.window,
       growth: this.state.growth,
       unfold: this.unfold,
       bounds: this.current?.bounds ?? null,

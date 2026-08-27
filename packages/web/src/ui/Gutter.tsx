@@ -12,6 +12,9 @@ import { useViewerState } from './useViewer.js';
 
 export function Gutter() {
   const s = useViewerState();
+  // byAuthor has no time axis on the trunk and timeline lays time along X, so
+  // neither has a core to take. Showing one anyway would be a lie about scale.
+  if (s.mode === 'byAuthor' || s.mode === 'timeline') return null;
   if (!s.rings.length && s.growth >= 1) return null;
 
   const majors = s.rings.filter((r) => r.major);
