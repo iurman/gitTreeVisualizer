@@ -12,7 +12,7 @@
   "dependencies": {
     "@gittree/core": "workspace:*",
     "@gittree/web": "workspace:*",
-    "@vercel/og": "^1.0.2",
+    "@resvg/resvg-js": "^2.6.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

@@ -40,6 +40,12 @@ export type SilhouetteOptions = {
   subtitle?: string;
   /** Draw the caption band. Off for the in-page fallback, on for the share card. */
   caption?: boolean;
+  /**
+   * Registration corner marks and a hairline plate border. A portrait tree in a
+   * landscape frame leaves a lot of ground either side; the marks make that
+   * read as a specimen plate rather than as empty space.
+   */
+  plateMarks?: boolean;
 };
 
 const esc = (s: string) =>
@@ -136,6 +142,24 @@ export function silhouetteSvg(
     const r = Math.max(0.9, sz * scale * 0.42);
     const fill = node?.isMerge ? c.leafAlt : c.leaf;
     parts.push(`<rect x="${(x - r).toFixed(1)}" y="${(y - r).toFixed(1)}" width="${(r * 2).toFixed(1)}" height="${(r * 2).toFixed(1)}" fill="${fill}"/>`);
+  }
+
+  if (opts.plateMarks) {
+    const m = 22;
+    const arm = 26;
+    parts.push(
+      `<rect x="${m}.5" y="${m}.5" width="${W - m * 2 - 1}" height="${H - m * 2 - 1}" fill="none" stroke="${c.ring}" stroke-width="1" opacity="0.28"/>`,
+    );
+    for (const [x, y, dx, dy] of [
+      [m, m, 1, 1],
+      [W - m, m, -1, 1],
+      [m, H - m, 1, -1],
+      [W - m, H - m, -1, -1],
+    ] as const) {
+      parts.push(
+        `<path d="M ${x + dx * arm} ${y} H ${x} V ${y + dy * arm}" fill="none" stroke="${c.ring}" stroke-width="2" opacity="0.75"/>`,
+      );
+    }
   }
 
   if (opts.caption) {

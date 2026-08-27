@@ -356,7 +356,15 @@ thousands of them cost nothing. Both move zero vertices on the CPU.
   2,000 commits, `s-maxage=3600, stale-while-revalidate=86400`, per-IP rate
   limited so someone scripting random repositories burns their own budget.
 - `silhouette/[owner]/[name].ts` — the flat SVG, for browsers without WebGL.
-- `og.tsx` — the share card, embedding the same SVG.
+- `og.ts` — the share card. The same SVG, rasterized to PNG by resvg.
+
+The card carries no text. Every platform renders `og:title` and `og:description`
+as type beside the image, so baking the repository name into the picture only
+duplicates it — and leaving it out means the renderer needs no fonts, which is
+what lets this be a plain SVG through a rasterizer rather than a layout engine
+with an asset bundle behind it. `@vercel/og` is not used: outside Next.js it is
+an unsupported external for Edge Functions, and its Node build wants both
+`__dirname` and `import.meta.url`, which do not coexist in an ESM function.
 
 The SVG renderer lives in `core` and reads the same `LayoutResult` the GPU
 does, so a share card is the same tree, at the same window and granularity, as
