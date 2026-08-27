@@ -1,3 +1,4 @@
+/** @jsxImportSource react */
 import { ImageResponse } from '@vercel/og';
 import {
   autoRingUnit,
@@ -23,6 +24,14 @@ const GROUND = '#0A1424';
 const INK = '#F3EFDE';
 const MUTED = '#8D9490';
 const ACCENT = '#2FA98C';
+
+/** UTF-8 safe, and available in every runtime this might run in. */
+function toBase64(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
 
 export default async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
@@ -103,7 +112,7 @@ export default async function handler(req: Request): Promise<Response> {
           <img
             width={660}
             height={630}
-            src={`data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(art)))}`}
+            src={`data:image/svg+xml;base64,${toBase64(art)}`}
             style={{ width: 660, height: 630 }}
           />
         ) : (
