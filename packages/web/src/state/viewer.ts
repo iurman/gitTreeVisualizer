@@ -123,6 +123,13 @@ export class Viewer {
   private unfold = 1;
   private unfoldTarget = 1;
   private renderScale = 1;
+  /**
+   * Three plain numbers rather than a Vector3: this module deliberately does
+   * not import Three, so that half a megabyte stays off the critical path and
+   * out of the landing page. A subtraction and a hypot is the whole of what a
+   * Vector3 would have been used for here.
+   */
+  private lastCameraPos: [number, number, number] = [0, 0, 0];
   private abort: AbortController | null = null;
 
   private listeners = new Set<() => void>();
@@ -889,7 +896,20 @@ export class Viewer {
       r.setUnfold(this.unfold);
     }
 
-    if (this.current) this.sound.setCameraHeight(r.cam.heightFactor(this.current.bounds));
+    if (this.current) {
+      // How far the camera travelled this frame drives the ambient bed, so it
+      // is heard while orbiting or flying and not at all while the tree sits still.
+      const p = r.cam.camera.position;
+      const moved = Math.hypot(
+        p.x - this.lastCameraPos[0],
+        p.y - this.lastCameraPos[1],
+        p.z - this.lastCameraPos[2],
+      );
+      this.lastCameraPos[0] = p.x;
+      this.lastCameraPos[1] = p.y;
+      this.lastCameraPos[2] = p.z;
+      this.sound.setSpace(r.cam.heightFactor(this.current.bounds), moved);
+    }
     r.render(now);
 
     if (now % 500 < 17 && Math.abs(r.fps - this.state.fps) > 2) this.set({ fps: Math.round(r.fps) });
