@@ -7,7 +7,7 @@
 /* React. The reasoning is in DESIGN.md.                                       */
 /* -------------------------------------------------------------------------- */
 
-@import url('https://fonts.googleapis.com/css2?family=Old+Standard+TT:ital,wght@0,400;0,700;1,400&family=Archivo:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+@import './fontface.css';
 
 :root {
   /* Ground: the plate. */

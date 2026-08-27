@@ -7,20 +7,25 @@ import type { LayoutMode, LayoutOptions, LayoutResult, LensAttributes, LensName,
  * already scrolled past.
  */
 export class LayoutClient {
-  private worker: Worker;
+  private worker: Worker | null = null;
   private nextId = 1;
   private pendingLayout = new Map<number, (r: LayoutResult) => void>();
   private pendingLens = new Map<number, (a: LensAttributes) => void>();
   private latestLayout = 0;
-  private ready: Promise<void>;
-  private resolveReady!: () => void;
+  private ready: Promise<void> = Promise.resolve();
+  private resolveReady: () => void = () => {};
 
-  constructor() {
-    this.worker = new Worker(new URL('./layoutWorker.ts', import.meta.url), { type: 'module' });
-    this.ready = new Promise((res) => {
-      this.resolveReady = res;
-    });
-    this.worker.onmessage = (e: MessageEvent) => {
+  /**
+   * The worker is spawned on the first snapshot, not on construction. The
+   * viewer is built as soon as the application mounts, including on the landing
+   * page where there is nothing to lay out — and spawning a module worker there
+   * costs a script fetch and a thread that then sits idle until someone types a
+   * repository name.
+   */
+  private spawn(): Worker {
+    if (this.worker) return this.worker;
+    const worker = new Worker(new URL('./layoutWorker.ts', import.meta.url), { type: 'module' });
+    worker.onmessage = (e: MessageEvent) => {
       const d = e.data;
       if (d.type === 'ready') {
         this.resolveReady();
@@ -38,13 +43,21 @@ export class LayoutClient {
         cb?.(d as LensAttributes);
       }
     };
+    this.worker = worker;
+    return worker;
+  }
+
+  /** Start the worker without giving it anything to do yet. */
+  warm(): void {
+    this.spawn();
   }
 
   setSnapshot(snapshot: RepoSnapshot, directory: boolean): Promise<void> {
+    const worker = this.spawn();
     this.ready = new Promise((res) => {
       this.resolveReady = res;
     });
-    this.worker.postMessage({ type: 'snapshot', snapshot, directory });
+    worker.postMessage({ type: 'snapshot', snapshot, directory });
     return this.ready;
   }
 
@@ -54,7 +67,7 @@ export class LayoutClient {
     this.latestLayout = id;
     return new Promise((resolve) => {
       this.pendingLayout.set(id, resolve);
-      this.worker.postMessage({ type: 'layout', id, mode, opts });
+      this.spawn().postMessage({ type: 'layout', id, mode, opts });
     });
   }
 
@@ -63,11 +76,12 @@ export class LayoutClient {
     const id = this.nextId++;
     return new Promise((resolve) => {
       this.pendingLens.set(id, resolve);
-      this.worker.postMessage({ type: 'lens', id, lens });
+      this.spawn().postMessage({ type: 'lens', id, lens });
     });
   }
 
   dispose(): void {
-    this.worker.terminate();
+    this.worker?.terminate();
+    this.worker = null;
   }
 }

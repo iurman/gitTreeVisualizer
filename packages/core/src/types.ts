@@ -1,71 +1,64 @@
-import { z } from 'zod';
-
 /* -------------------------------------------------------------------------- */
 /* 1. The data contract                                                        */
 /*                                                                            */
 /* Every data source produces this identical shape. The viewer knows only the  */
 /* `source` field, and only to show a badge. v2's local CLI adapter emits the  */
 /* same object and nothing downstream changes.                                 */
+/*                                                                            */
+/* Plain types, and the runtime check that guards them lives in snapshot.ts.   */
+/* They were Zod schemas with the types inferred from them, which reads well   */
+/* and cost the browser a quarter of a megabyte of source to validate a        */
+/* response from an API in this same repository. Splitting them means this     */
+/* module is types and constants only, so importing a type here can never drag */
+/* a validator into the bundle.                                                */
 /* -------------------------------------------------------------------------- */
 
-export const CommitSchema = z.object({
-  oid: z.string().min(1),
+export type Commit = {
+  oid: string;
   /** Full SHAs, ordered. parents[0] is the first parent. */
-  parents: z.array(z.string().min(1)),
-  author: z.string(),
-  authorEmail: z.string(),
+  parents: string[];
+  author: string;
+  authorEmail: string;
   /** ISO 8601 */
-  date: z.string(),
-  subject: z.string(),
-  additions: z.number().int().nonnegative(),
-  deletions: z.number().int().nonnegative(),
-  filesChanged: z.number().int().nonnegative(),
-  prNumber: z.number().int().positive().optional(),
+  date: string;
+  subject: string;
+  additions: number;
+  deletions: number;
+  filesChanged: number;
+  prNumber?: number;
   /** Commit count of the associated PR, when the host reports it. Drives squash reconstruction. */
-  prCommitCount: z.number().int().positive().optional(),
+  prCommitCount?: number;
   /**
    * Dominant file extension touched by this commit, when the source can supply
    * it. GitHub's GraphQL API cannot, so this is only populated in directory
    * mode and by v2's local adapter. The file-type lens says so rather than
    * inventing a value.
    */
-  ext: z.string().optional(),
-});
-export type Commit = z.infer<typeof CommitSchema>;
+  ext?: string;
+};
 
-export const RefSchema = z.object({
-  name: z.string(),
-  oid: z.string().min(1),
-  kind: z.enum(['branch', 'tag', 'remote']),
-});
-export type Ref = z.infer<typeof RefSchema>;
+export type Ref = {
+  name: string;
+  oid: string;
+  kind: 'branch' | 'tag' | 'remote';
+};
 
-export const RepoSnapshotSchema = z.object({
-  schemaVersion: z.literal(1),
+export type RepoSnapshot = {
+  schemaVersion: 1;
   /** "owner/repo" */
-  name: z.string(),
-  description: z.string().nullable(),
-  head: z.string(),
-  defaultBranch: z.string(),
+  name: string;
+  description: string | null;
+  head: string;
+  defaultBranch: string;
   /** v2 adds 'local'. */
-  source: z.enum(['github', 'local']),
-  truncated: z.boolean(),
-  generatedAt: z.string(),
-  commits: z.array(CommitSchema),
-  refs: z.array(RefSchema),
+  source: 'github' | 'local';
+  truncated: boolean;
+  generatedAt: string;
+  commits: Commit[];
+  refs: Ref[];
   /** Optional file tree at HEAD, used only by the directory-mode fallback. */
-  tree: z.array(z.object({ path: z.string(), size: z.number().nonnegative() })).optional(),
-});
-export type RepoSnapshot = z.infer<typeof RepoSnapshotSchema>;
-
-/**
- * The adapter boundary. Anything claiming to be a RepoSnapshot passes through
- * here first, so malformed data fails at the seam instead of deep inside
- * layout code where the stack trace means nothing.
- */
-export function parseSnapshot(input: unknown): RepoSnapshot {
-  return RepoSnapshotSchema.parse(input);
-}
+  tree?: { path: string; size: number }[];
+};
 
 export class TopologyError extends Error {
   constructor(message: string, readonly code: string) {

@@ -338,6 +338,45 @@ describe('software rasterizer', () => {
     expect(r.color.length).toBe(16 * 16);
   });
 
+  it('steps the edge functions to exactly where evaluating them would land', () => {
+    // fillTri walks the barycentrics incrementally rather than evaluating them
+    // per pixel. That is worth a third of the frame time and is exactly the
+    // kind of change that drifts: accumulate a rounding error across a scanline
+    // and edges gain holes. Compare against the straightforward evaluation of
+    // the same formula, pixel for pixel, on triangles of awkward shapes.
+    const tris: [number, number, number, number, number, number][] = [
+      [2, 2, 30, 3, 29, 27],
+      [0, 0, 31, 0, 15, 31],
+      [31, 31, 0, 31, 16, 0],
+      [5, 1, 6, 30, 7, 2],
+      [-8, -8, 40, 4, 12, 44],
+    ];
+    for (const [x0, y0, x1, y1, x2, y2] of tris) {
+      const r = new Raster();
+      r.resize(32, 32);
+      r.clear(hexToRgb(PALETTE[0]));
+      const c = hexToRgb(PALETTE[15]);
+      r.fillTri(x0, y0, 10, x1, y1, 10, x2, y2, 10, c[0], c[1], c[2]);
+
+      const area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+      const inv = 1 / area;
+      for (let py = 0; py < 32; py++) {
+        for (let px = 0; px < 32; px++) {
+          const fx = px + 0.5;
+          const fy = py + 0.5;
+          const w0 = ((x1 - x0) * (fy - y0) - (fx - x0) * (y1 - y0)) * inv;
+          const w1 = ((fx - x0) * (y2 - y0) - (x2 - x0) * (fy - y0)) * inv;
+          const inside = w0 >= 0 && w1 >= 0 && w0 + w1 <= 1;
+          const drawn = r.depth[py * 32 + px] !== 0;
+          // A pixel within a rounding error of an edge may go either way; only
+          // pixels clearly inside or outside have to agree.
+          const margin = Math.min(w0, w1, 1 - w0 - w1);
+          if (Math.abs(margin) > 1e-6) expect(drawn).toBe(inside);
+        }
+      }
+    }
+  });
+
   it('ignores a degenerate triangle', () => {
     const r = raster();
     r.clear(hexToRgb(PALETTE[0]));

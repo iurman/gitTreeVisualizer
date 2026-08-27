@@ -15,49 +15,69 @@ import { PALETTE, PALETTE_LINEAR, hexToRgb, toLinear, type RGB } from '../palett
 /* at write time through a lookup table instead of per-pixel at the end.       */
 /* -------------------------------------------------------------------------- */
 
-/** 5 bits per channel: 32,768 cells, each holding the nearest palette index. */
+/* -------------------------------------------------------------------------- */
+/* Quantization                                                                */
+/*                                                                            */
+/* A 5-bit-per-channel cube mapping an sRGB colour to the nearest palette      */
+/* entry, matched in linear space the way the shader matches it.               */
+/*                                                                            */
+/* Filled on demand rather than up front. Building all 32,768 cells costs      */
+/* 786,000 distance computations — 56 ms on a fast desktop, and several        */
+/* hundred on a phone, blocking the very first frame on exactly the machines   */
+/* most likely to be running the software renderer in the first place. A tree  */
+/* touches a few hundred distinct cells, so the miss path runs a few hundred   */
+/* times and then never again. 0xFF is the empty marker: the palette has       */
+/* twenty-four entries, so it can never be a real answer.                      */
+/* -------------------------------------------------------------------------- */
+
 const LUT_BITS = 5;
 const LUT_SIZE = 1 << (LUT_BITS * 3);
-let LUT: Uint8Array | null = null;
+const LUT_EMPTY = 0xff;
+const LUT_MAX = (1 << LUT_BITS) - 1;
+const LUT = new Uint8Array(LUT_SIZE).fill(LUT_EMPTY);
 
-/** Nearest palette entry to an sRGB colour, matched in linear space. */
-export function paletteLut(): Uint8Array {
-  if (LUT) return LUT;
-  const lut = new Uint8Array(LUT_SIZE);
-  const step = 255 / ((1 << LUT_BITS) - 1);
-  for (let r = 0; r < 1 << LUT_BITS; r++) {
-    for (let g = 0; g < 1 << LUT_BITS; g++) {
-      for (let b = 0; b < 1 << LUT_BITS; b++) {
-        const lin = toLinear([(r * step) / 255, (g * step) / 255, (b * step) / 255]);
-        let best = 0;
-        let bestD = Infinity;
-        for (let i = 0; i < PALETTE_LINEAR.length; i++) {
-          const c = PALETTE_LINEAR[i];
-          const dr = c[0] - lin[0];
-          const dg = c[1] - lin[1];
-          const db = c[2] - lin[2];
-          const d = dr * dr + dg * dg + db * db;
-          if (d < bestD) {
-            bestD = d;
-            best = i;
-          }
-        }
-        lut[(r << (LUT_BITS * 2)) | (g << LUT_BITS) | b] = best;
-      }
+/** The nearest palette entry to one cell of the cube. Runs once per cell, ever. */
+function resolveCell(key: number): number {
+  const step = 255 / LUT_MAX / 255;
+  const lin = toLinear([
+    ((key >> (LUT_BITS * 2)) & LUT_MAX) * step,
+    ((key >> LUT_BITS) & LUT_MAX) * step,
+    (key & LUT_MAX) * step,
+  ]);
+  let best = 0;
+  let bestD = Infinity;
+  for (let i = 0; i < PALETTE_LINEAR.length; i++) {
+    const c = PALETTE_LINEAR[i];
+    const dr = c[0] - lin[0];
+    const dg = c[1] - lin[1];
+    const db = c[2] - lin[2];
+    const d = dr * dr + dg * dg + db * db;
+    if (d < bestD) {
+      bestD = d;
+      best = i;
     }
   }
-  LUT = lut;
-  return lut;
+  LUT[key] = best;
+  return best;
+}
+
+/** The lookup table itself, for callers that index it in a tight loop. */
+export function paletteLut(): Uint8Array {
+  return LUT;
+}
+
+/** Resolve one cube cell, filling it if this is the first time it is asked for. */
+export function lookup(key: number): number {
+  const v = LUT[key];
+  return v === LUT_EMPTY ? resolveCell(key) : v;
 }
 
 /** Quantize an sRGB triple in 0..1 to a palette index. */
 export function quantize(r: number, g: number, b: number): number {
-  const lut = paletteLut();
-  const m = (1 << LUT_BITS) - 1;
-  const ri = Math.max(0, Math.min(m, Math.round(r * m)));
-  const gi = Math.max(0, Math.min(m, Math.round(g * m)));
-  const bi = Math.max(0, Math.min(m, Math.round(b * m)));
-  return lut[(ri << (LUT_BITS * 2)) | (gi << LUT_BITS) | bi];
+  const ri = r <= 0 ? 0 : r >= 1 ? LUT_MAX : (r * LUT_MAX + 0.5) | 0;
+  const gi = g <= 0 ? 0 : g >= 1 ? LUT_MAX : (g * LUT_MAX + 0.5) | 0;
+  const bi = b <= 0 ? 0 : b >= 1 ? LUT_MAX : (b * LUT_MAX + 0.5) | 0;
+  return lookup((ri << (LUT_BITS * 2)) | (gi << LUT_BITS) | bi);
 }
 
 /* 4x4 Bayer, the same matrix the WebGL post pass uses. Ordered dither is the
@@ -102,6 +122,13 @@ export class Raster {
   depth = new Float32Array(0);
   /** Radial falloff toward the plate edge, precomputed once per resize. */
   private vig = new Float32Array(0);
+  /**
+   * The ordered-dither offset for each pixel, also precomputed. It only depends
+   * on x and y modulo four, but reading it costs one indexed load where
+   * recomputing it costs a call, two masks, a multiply and a subtract — per
+   * pixel, per primitive, for every pixel the tree covers.
+   */
+  private bias = new Float32Array(0);
 
   private image: ImageData | null = null;
   private words: Uint32Array | null = null;
@@ -126,12 +153,15 @@ export class Raster {
     this.color = new Uint8Array(width * height);
     this.depth = new Float32Array(width * height);
     this.vig = new Float32Array(width * height);
+    this.bias = new Float32Array(width * height);
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const dx = (x + 0.5) / width - 0.5;
         const dy = (y + 0.5) / height - 0.5;
         const r = Math.hypot(dx, dy) * 1.42;
-        this.vig[y * width + x] = 1 - VIGNETTE * r * r;
+        const i = y * width + x;
+        this.vig[i] = 1 - VIGNETTE * r * r;
+        this.bias[i] = (BAYER[(y & 3) * 4 + (x & 3)] / 16 - 0.5) * DITHER;
       }
     }
     // Without a context there is no ImageData to expand into; the colour and
@@ -143,25 +173,19 @@ export class Raster {
 
   clear(rgb: RGB): void {
     this.depth.fill(0);
-    const lut = paletteLut();
-    const m = (1 << LUT_BITS) - 1;
+    const m = LUT_MAX;
     const w = this.width;
     for (let y = 0; y < this.height; y++) {
       for (let x = 0; x < w; x++) {
         const i = y * w + x;
         const v = this.vig[i];
-        const d = this.dither(x, y);
-        const ri = clamp255(Math.round((rgb[0] * v + d) * m), m);
-        const gi = clamp255(Math.round((rgb[1] * v + d) * m), m);
-        const bi = clamp255(Math.round((rgb[2] * v + d) * m), m);
-        this.color[i] = lut[(ri << (LUT_BITS * 2)) | (gi << LUT_BITS) | bi];
+        const d = this.bias[i];
+        const ri = clampCell(rgb[0] * v + d, m);
+        const gi = clampCell(rgb[1] * v + d, m);
+        const bi = clampCell(rgb[2] * v + d, m);
+        this.color[i] = lookup((ri << (LUT_BITS * 2)) | (gi << LUT_BITS) | bi);
       }
     }
-  }
-
-  /** Ordered-dither offset for a pixel, in 0..1 palette-cell units. */
-  private dither(x: number, y: number): number {
-    return (BAYER[(y & 3) * 4 + (x & 3)] / 16 - 0.5) * DITHER;
   }
 
   /**
@@ -188,31 +212,40 @@ export class Raster {
     if (minX > maxX || minY > maxY) return;
 
     const inv = 1 / area;
-    const lut = paletteLut();
-    const m = (1 << LUT_BITS) - 1;
+    const m = LUT_MAX;
     const i0 = 1 / Math.max(1e-6, z0);
     const i1 = 1 / Math.max(1e-6, z1);
     const i2 = 1 / Math.max(1e-6, z2);
 
-    for (let py = minY; py <= maxY; py++) {
-      const fy = py + 0.5;
-      for (let px = minX; px <= maxX; px++) {
-        const fx = px + 0.5;
-        const w0 = ((x1 - x0) * (fy - y0) - (fx - x0) * (y1 - y0)) * inv;
-        const w1 = ((fx - x0) * (y2 - y0) - (x2 - x0) * (fy - y0)) * inv;
+    // Barycentrics are affine in screen space, so they can be stepped rather
+    // than recomputed: six multiplies per pixel become two additions. At a
+    // hundred thousand covered pixels a frame that is the difference between
+    // the software renderer holding sixty and not.
+    const dw0dx = -(y1 - y0) * inv;
+    const dw0dy = (x1 - x0) * inv;
+    const dw1dx = (y2 - y0) * inv;
+    const dw1dy = -(x2 - x0) * inv;
+    const fx0 = minX + 0.5;
+    let rowW0 = ((x1 - x0) * (minY + 0.5 - y0) - (fx0 - x0) * (y1 - y0)) * inv;
+    let rowW1 = ((fx0 - x0) * (y2 - y0) - (x2 - x0) * (minY + 0.5 - y0)) * inv;
+
+    for (let py = minY; py <= maxY; py++, rowW0 += dw0dy, rowW1 += dw1dy) {
+      let w0 = rowW0;
+      let w1 = rowW1;
+      const row = py * w;
+      for (let px = minX; px <= maxX; px++, w0 += dw0dx, w1 += dw1dx) {
         if (w0 < 0 || w1 < 0 || w0 + w1 > 1) continue;
-        const w2 = 1 - w0 - w1;
-        // w1 weights vertex 1, w0 weights vertex 2, w2 weights vertex 0.
-        const iz = i0 * w2 + i1 * w1 + i2 * w0;
-        const i = py * w + px;
+        // w1 weights vertex 1, w0 weights vertex 2, the remainder vertex 0.
+        const iz = i0 * (1 - w0 - w1) + i1 * w1 + i2 * w0;
+        const i = row + px;
         if (iz <= this.depth[i]) continue;
         const v = this.vig[i];
-        const d = this.dither(px, py);
-        const ri = clamp255(Math.round((r * v + d) * m), m);
-        const gi = clamp255(Math.round((g * v + d) * m), m);
-        const bi = clamp255(Math.round((b * v + d) * m), m);
+        const d = this.bias[i];
+        const ri = clampCell(r * v + d, m);
+        const gi = clampCell(g * v + d, m);
+        const bi = clampCell(b * v + d, m);
         this.depth[i] = iz;
-        this.color[i] = lut[(ri << (LUT_BITS * 2)) | (gi << LUT_BITS) | bi];
+        this.color[i] = lookup((ri << (LUT_BITS * 2)) | (gi << LUT_BITS) | bi);
       }
     }
   }
@@ -239,8 +272,7 @@ export class Raster {
     if (minX > maxX || minY > maxY) return;
 
     const inv = 1 / area;
-    const lut = paletteLut();
-    const m = (1 << LUT_BITS) - 1;
+    const m = LUT_MAX;
     const i0 = 1 / Math.max(1e-6, z0);
     const i1 = 1 / Math.max(1e-6, z1);
     const i2 = 1 / Math.max(1e-6, z2);
@@ -252,25 +284,32 @@ export class Raster {
     const r1 = c1[0] * i1, g1 = c1[1] * i1, bb1 = c1[2] * i1;
     const r2 = c2[0] * i2, g2 = c2[1] * i2, bb2 = c2[2] * i2;
 
-    for (let py = minY; py <= maxY; py++) {
-      const fy = py + 0.5;
-      for (let px = minX; px <= maxX; px++) {
-        const fx = px + 0.5;
-        const b2 = ((x1 - x0) * (fy - y0) - (fx - x0) * (y1 - y0)) * inv;
-        const b1 = ((fx - x0) * (y2 - y0) - (x2 - x0) * (fy - y0)) * inv;
+    const db2dx = -(y1 - y0) * inv;
+    const db2dy = (x1 - x0) * inv;
+    const db1dx = (y2 - y0) * inv;
+    const db1dy = -(x2 - x0) * inv;
+    const fx0 = minX + 0.5;
+    let rowB2 = ((x1 - x0) * (minY + 0.5 - y0) - (fx0 - x0) * (y1 - y0)) * inv;
+    let rowB1 = ((fx0 - x0) * (y2 - y0) - (x2 - x0) * (minY + 0.5 - y0)) * inv;
+
+    for (let py = minY; py <= maxY; py++, rowB2 += db2dy, rowB1 += db1dy) {
+      let b2 = rowB2;
+      let b1 = rowB1;
+      const row = py * w;
+      for (let px = minX; px <= maxX; px++, b2 += db2dx, b1 += db1dx) {
         if (b2 < 0 || b1 < 0 || b2 + b1 > 1) continue;
         const b0 = 1 - b2 - b1;
         const iz = i0 * b0 + i1 * b1 + i2 * b2;
-        const i = py * w + px;
+        const i = row + px;
         if (iz <= this.depth[i]) continue;
         const s = 1 / iz;
-        const v = this.vig[i];
-        const d = this.dither(px, py);
-        const ri = clamp255(Math.round(((r0 * b0 + r1 * b1 + r2 * b2) * s * v + d) * m), m);
-        const gi = clamp255(Math.round(((g0 * b0 + g1 * b1 + g2 * b2) * s * v + d) * m), m);
-        const bi = clamp255(Math.round(((bb0 * b0 + bb1 * b1 + bb2 * b2) * s * v + d) * m), m);
+        const v = this.vig[i] * s;
+        const d = this.bias[i];
+        const ri = clampCell((r0 * b0 + r1 * b1 + r2 * b2) * v + d, m);
+        const gi = clampCell((g0 * b0 + g1 * b1 + g2 * b2) * v + d, m);
+        const bi = clampCell((bb0 * b0 + bb1 * b1 + bb2 * b2) * v + d, m);
         this.depth[i] = iz;
-        this.color[i] = lut[(ri << (LUT_BITS * 2)) | (gi << LUT_BITS) | bi];
+        this.color[i] = lookup((ri << (LUT_BITS * 2)) | (gi << LUT_BITS) | bi);
       }
     }
   }
@@ -287,20 +326,19 @@ export class Raster {
     const minY = Math.max(0, y0);
     const maxY = Math.min(h - 1, Math.max(y0, Math.round(y + half) - 1));
     if (minX > maxX || minY > maxY) return;
-    const lut = paletteLut();
-    const m = (1 << LUT_BITS) - 1;
+    const m = LUT_MAX;
     const iz = 1 / Math.max(1e-6, z);
     for (let py = minY; py <= maxY; py++) {
       for (let px = minX; px <= maxX; px++) {
         const i = py * w + px;
         if (iz <= this.depth[i]) continue;
         const v = this.vig[i];
-        const d = this.dither(px, py);
-        const ri = clamp255(Math.round((r * v + d) * m), m);
-        const gi = clamp255(Math.round((g * v + d) * m), m);
-        const bi = clamp255(Math.round((b * v + d) * m), m);
+        const d = this.bias[i];
+        const ri = clampCell(r * v + d, m);
+        const gi = clampCell(g * v + d, m);
+        const bi = clampCell(b * v + d, m);
         this.depth[i] = iz;
-        this.color[i] = lut[(ri << (LUT_BITS * 2)) | (gi << LUT_BITS) | bi];
+        this.color[i] = lookup((ri << (LUT_BITS * 2)) | (gi << LUT_BITS) | bi);
       }
     }
   }
@@ -330,6 +368,13 @@ export class Raster {
   }
 }
 
-function clamp255(v: number, m: number): number {
-  return v < 0 ? 0 : v > m ? m : v;
+/**
+ * A 0..1 colour channel to a whole cube cell. `(x + 0.5) | 0` in place of
+ * Math.round, guarded by the clamp either side so the truncation only ever sees
+ * a non-negative number in range.
+ */
+function clampCell(v: number, m: number): number {
+  if (!(v > 0)) return 0;
+  const scaled = v * m + 0.5;
+  return scaled >= m ? m : scaled | 0;
 }

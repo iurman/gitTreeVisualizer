@@ -2,15 +2,15 @@ export { App } from './ui/App.jsx';
 export { Viewer } from './state/viewer.js';
 export type { ViewerState } from './state/viewer.js';
 // The rendering stack, for embedders that need to force a backend or report
-// which one is running.
+// which one is running. Value exports here are three-free by construction; the
+// backends themselves are behind loadRenderStack so they stay a lazy chunk.
 export {
-  createRenderer,
   detectRenderCapabilities,
   forcedRenderer,
+  loadRenderStack,
   preferredRenderer,
+  prefetchRenderStack,
   probeWebGL2,
-  Canvas2DBackend,
-  WebGLBackend,
   type RenderBackend,
   type RenderCapabilities,
   type RendererKind,

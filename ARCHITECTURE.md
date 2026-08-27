@@ -24,7 +24,7 @@ has been broken.
   /site        vercel deployment: the viewer plus serverless routes.
 ```
 
-`core` has one runtime dependency (zod) and imports nothing that assumes a
+`core` has no runtime dependencies at all and imports nothing that assumes a
 browser. That is what lets the same layout code run in a worker, in a Node
 serverless function drawing a share image, and in a unit test with no DOM.
 
@@ -32,10 +32,18 @@ serverless function drawing a share image, and in a unit test with no DOM.
 
 ## 1. The adapter boundary
 
-`core/src/types.ts` defines `RepoSnapshot` and validates it with zod. Every
-source parses through `parseSnapshot` at the seam, so malformed data fails
-where the stack trace still points at the source rather than deep inside a
-layout function.
+`core/src/types.ts` defines `RepoSnapshot` as plain types and
+`core/src/snapshot.ts` checks it. Every source parses through `parseSnapshot`
+at the seam, so malformed data fails where the stack trace still points at the
+source rather than deep inside a layout function.
+
+The check was a Zod schema, and Zod was the single largest thing in the browser
+bundle: about 250 kB of source, including a JSON-Schema exporter this project
+never calls, shipped to validate a response from an API in this same
+repository. A schema library earns that when the shape is negotiated with
+someone else or changes often. This one is neither — eleven fields, ours at
+both ends — so it is a hand-written check that reports the path of the first
+field that does not hold up, and `core` has no dependencies.
 
 ```ts
 type RepoSnapshot = {
@@ -426,7 +434,76 @@ fonts.
 
 ---
 
-## 6. Adding a feature
+## 6. The load path
+
+Measured on a throttled connection (9 Mbps, 40 ms RTT, CPU at a quarter speed),
+which is roughly a mid-range phone on good 4G.
+
+| | before | after |
+|---|---|---|
+| First contentful paint | 13.5 s | 0.65 s |
+| Landing page transfer | 1,240 kB over 11 requests | 380 kB over 9 |
+| Eager JavaScript | 240 kB gzipped | 81 kB gzipped |
+| Layout worker bundle | 94 kB | 25 kB |
+| Tree laid out, 1,400 commits | — | 2.2 s |
+
+Four things were wrong, in descending order of how much they mattered.
+
+**The fonts blocked everything.** `styles.css` opened with an `@import` of a
+Google Fonts stylesheet. A remote `@import` is render-blocking and serially
+chained: fetch our CSS, parse it, discover the import, fetch Google's CSS,
+parse that, discover the woff2 URLs, fetch those. Worse than slow, it is a
+single point of failure on a third party. In the environment this was measured
+in, `fonts.googleapis.com` was unreachable; every local asset landed in 59 ms
+and the page then painted **nothing at all for 12.7 seconds** waiting for the
+connection to be reset. That is not a hypothetical — the same thing happens on
+corporate networks that block the domain. The faces are now self-hosted, hashed
+into `/assets` behind the immutable cache header, latin and latin-ext only, and
+a build plugin preloads the three regular faces so they start downloading with
+the HTML rather than after the stylesheet parses.
+
+**Three.js was on the critical path.** Half a megabyte, fetched and parsed
+before anything rendered, including on the landing page which has no canvas.
+`render/load.ts` is now the seam: it imports only types, so it sits in the eager
+bundle while everything behind it is a lazy chunk. The interface asks for that
+chunk the moment it knows a repository is being opened, so it downloads
+alongside the first page of history rather than in front of it — the fetch is
+the long pole either way. The layout worker is spawned on the same trigger for
+the same reason.
+
+**Zod shipped to the browser.** Covered above; it also took the worker bundle
+from 94 kB to 25 kB, since the worker imports `core` too.
+
+**The growth animation allocated.** `applyLayout` runs on every keyframe, about
+eighteen times a second for the length of the intro, and it allocated fresh
+typed arrays for limb heights, ring centres and the ring texture every time —
+over a megabyte per keyframe on a large repository, during the one animation
+the product exists for. They are scratch buffers sized once per repository now.
+The per-leaf attribute writes (lens, dim, falling) share one staging array,
+which matters most for search, where `setDim` ran once per keystroke.
+
+### The software rasterizer
+
+Two changes, both measured by `render/bench.bench.test.ts`:
+
+- **The palette lookup table fills on demand.** Building all 32,768 cells up
+  front is 786,000 distance computations — 38 ms on a fast desktop and several
+  hundred on a phone, blocking the first frame on exactly the machines most
+  likely to be running the software renderer at all. A tree touches a few
+  hundred distinct cells.
+- **Barycentrics are stepped, not recomputed.** They are affine in screen
+  space, so six multiplies per pixel become two additions. With the per-pixel
+  dither offset precomputed alongside the vignette, a frame went from 14.4 ms
+  to 9.5 ms — a 70 fps ceiling to 105.
+
+Both are the kind of change that silently corrupts output, so
+`render.test.ts` checks the stepped edge functions against a direct evaluation
+of the same formula, pixel for pixel, across five awkward triangles including
+one that extends far off-screen.
+
+---
+
+## 7. Adding a feature
 
 The test of this architecture is that new features are layout functions or
 attribute writes, never renderer changes.
@@ -445,7 +522,7 @@ thousands of them cost nothing. Both move zero vertices on the CPU.
 
 ---
 
-## 7. The serverless layer
+## 8. The serverless layer
 
 `apps/site/api/`.
 

@@ -9,6 +9,7 @@ import {
 } from '@gittree/core';
 import { GROUND, SPECIMEN, hexToRgb, type RGB } from '../palette.js';
 import { TreeCamera } from './camera.js';
+import { ringCentersCompact } from './limbs.js';
 import { MorphState, smoothstep } from './morph.js';
 import { Raster } from './raster.js';
 import { lensRgb } from './lensPalette.js';
@@ -163,7 +164,7 @@ export class Canvas2DBackend implements RenderBackend {
   applyLayout(result: LayoutResult, opts: TransitionOptions = {}): void {
     if (!this.tree) return;
     this.centersA.set(this.centersB);
-    ringCentersInto(result.limbVertices, this.slots, this.segments, this.centersB);
+    ringCentersCompact(result.limbVertices, this.slots, this.segments, this.centersB);
     if (!this.morph.current) this.centersA.set(this.centersB);
 
     this.morph.push(result);
@@ -645,28 +646,4 @@ function lerp(a: number, b: number, t: number): number {
 
 function mix(a: RGB, b: RGB, t: number): RGB {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-}
-
-/** Ring centres, derived from the six vertices of each ring. */
-export function ringCentersInto(
-  limbVertices: Float32Array,
-  slots: number,
-  segments: number,
-  out: Float32Array,
-): Float32Array {
-  for (let r = 0; r < slots * segments; r++) {
-    let cx = 0;
-    let cy = 0;
-    let cz = 0;
-    const base = r * LIMB_RING_VERTS * 3;
-    for (let k = 0; k < LIMB_RING_VERTS; k++) {
-      cx += limbVertices[base + k * 3];
-      cy += limbVertices[base + k * 3 + 1];
-      cz += limbVertices[base + k * 3 + 2];
-    }
-    out[r * 3] = cx / LIMB_RING_VERTS;
-    out[r * 3 + 1] = cy / LIMB_RING_VERTS;
-    out[r * 3 + 2] = cz / LIMB_RING_VERTS;
-  }
-  return out;
 }

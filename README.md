@@ -149,7 +149,7 @@ pnpm build        # production build
 /apps/site        the Vercel deployment: viewer plus serverless routes
 ```
 
-`core` has one runtime dependency and no browser assumptions, so the same
+`core` has no runtime dependencies and no browser assumptions, so the same
 layout code runs in a worker, in a serverless function drawing a share image,
 and in a test with no DOM.
 
@@ -218,6 +218,38 @@ If the browser takes the graphics context away mid-session — which phones do
 under memory pressure, and a driver reset does on the desktop — the tree comes
 back when the context does. If it does not come back, the software renderer
 takes over rather than leaving a frozen canvas.
+
+---
+
+## Speed
+
+Measured on a throttled connection — 9 Mbps, 40 ms round trip, CPU at a quarter
+speed, roughly a mid-range phone on good 4G.
+
+| | before | after |
+|---|---|---|
+| First contentful paint | 13.5 s | 0.65 s |
+| Landing page | 1,240 kB, 11 requests | 380 kB, 9 requests |
+| JavaScript before first paint | 240 kB gzipped | 81 kB gzipped |
+| Tree laid out, 1,400 commits | — | 2.2 s |
+
+The 13.5 seconds was not a heavy page. Every local asset arrived in 59 ms and
+the browser then painted nothing while it waited on a render-blocking
+`@import` of a Google Fonts stylesheet that never resolved. The faces are
+self-hosted now, and nothing on the critical path leaves this origin.
+
+Three.js is half a megabyte and the landing page has no canvas, so it is loaded
+on demand — requested the moment a repository route is known, which puts it
+alongside the first page of history instead of in front of it. The layout
+worker is spawned on the same trigger. The snapshot validator is hand-written
+rather than a schema library, which took a quarter of a megabyte of source out
+of the bundle and left `core` with no dependencies at all.
+
+During growth, nothing allocates: the buffers the layout writes into are sized
+once per repository rather than per keyframe. The software renderer fills its
+palette table on demand instead of building all 32,768 entries before the first
+frame, and steps its edge functions across a scanline rather than recomputing
+them per pixel — together, 14.4 ms a frame down to 9.5.
 
 ---
 

@@ -1,4 +1,3 @@
-import * as THREE from 'three';
 import {
   SearchIndex,
   autoRingUnit,
@@ -21,8 +20,9 @@ import {
   type TimeWindow,
   type TreeStructure,
 } from '@gittree/core';
-import { createRenderer, type RendererSelection } from '../render/createRenderer.js';
+import { loadRenderStack, prefetchRenderStack } from '../render/load.js';
 import { detectRenderCapabilities, type RenderCapabilities } from '../render/capabilities.js';
+import type { RendererSelection } from '../render/createRenderer.js';
 import type { BackendEvent, RenderBackend, RendererKind } from '../render/backend.js';
 import { GrowthSonifier, SoundEngine, type GrowthEvent } from '../audio/engine.js';
 import { LayoutClient } from './layoutClient.js';
@@ -30,6 +30,8 @@ import { buildUrl, readUrl, writeUrl } from './url.js';
 import { fetchRepo, RepoError, type RepoRef } from './repo.js';
 
 export type Phase = 'idle' | 'loading' | 'seed' | 'growing' | 'ready' | 'error';
+
+type RenderStackFactory = (canvas: HTMLCanvasElement, caps?: RenderCapabilities) => RendererSelection;
 
 export type ViewerState = {
   phase: Phase;
@@ -93,6 +95,13 @@ export class Viewer {
   private forcedKind: RendererKind | null = null;
   /** Why we stopped using the GPU, kept across the remount that swaps renderers. */
   private demotionReason: string | null = null;
+  /**
+   * Bumped by every mount and unmount. The renderer arrives asynchronously now,
+   * and React mounts the canvas twice in development, so a load that resolves
+   * after its canvas has gone has to know to throw the result away rather than
+   * attach a renderer to a detached element.
+   */
+  private mountToken = 0;
   private sound = new SoundEngine();
   private sonifier = new GrowthSonifier();
   private layoutClient = new LayoutClient();
@@ -199,7 +208,38 @@ export class Viewer {
   /* Mount                                                                  */
   /* ---------------------------------------------------------------------- */
 
+  /**
+   * Start downloading the renderer without waiting for it. Called as soon as a
+   * repository route is known, so the chunk arrives alongside the first page of
+   * history rather than after it.
+   */
+  preloadRenderer(): void {
+    prefetchRenderStack();
+    // Same reasoning for the layout worker: it is spawned on demand so the
+    // landing page does not pay for it, and a repository route wants it warm
+    // before the first page of history lands.
+    this.layoutClient.warm();
+  }
+
   mount(canvas: HTMLCanvasElement): void {
+    const token = ++this.mountToken;
+    void this.startRenderer(canvas, token);
+  }
+
+  private async startRenderer(canvas: HTMLCanvasElement, token: number): Promise<void> {
+    let createRenderer: RenderStackFactory;
+    try {
+      ({ createRenderer } = await loadRenderStack());
+    } catch (e) {
+      console.error('[tree] the renderer could not be downloaded', e);
+      if (token === this.mountToken) {
+        this.set({ rendererFailed: true, renderer: null, rendererNote: (e as Error)?.message ?? null });
+      }
+      return;
+    }
+    // Unmounted, or remounted onto a different canvas, while the chunk loaded.
+    if (token !== this.mountToken) return;
+
     const caps: RenderCapabilities = {
       ...detectRenderCapabilities(),
       // A backend that has already failed on this page is never offered again.
@@ -243,7 +283,7 @@ export class Viewer {
     // set on mount, not construction, so it is always the instance on screen.
     (window as unknown as { __viewer?: Viewer }).__viewer = this;
     this.renderer.setReduceMotion(this.state.reduceMotion);
-    this.resize(canvas.clientWidth, canvas.clientHeight);
+    this.resize(canvas.clientWidth || this.pendingSize[0], canvas.clientHeight || this.pendingSize[1]);
     // The canvas can mount after the data has already arrived, and in
     // development it mounts twice. Either way the renderer is rebuilt from the
     // state the viewer already holds rather than waiting for another fetch.
@@ -304,7 +344,11 @@ export class Viewer {
     if (this.state.selected) r.setHighlight(this.tree.indexOf.get(this.state.selected) ?? -1, -1);
   }
 
+  /** The last size the interface reported, for a renderer that arrives after it. */
+  private pendingSize: [number, number] = [1, 1];
+
   resize(w: number, h: number): void {
+    this.pendingSize = [w, h];
     this.renderer?.resize(w, h);
     if (this.current) this.renderer?.cam.frame(this.current.bounds, w / Math.max(1, h));
   }
@@ -316,6 +360,7 @@ export class Viewer {
    * lay out.
    */
   unmount(): void {
+    this.mountToken++;
     cancelAnimationFrame(this.raf);
     this.raf = 0;
     this.renderer?.dispose();
@@ -929,5 +974,3 @@ function writeStored(s: Stored): void {
     /* private mode; the toggle still works for this session */
   }
 }
-
-export { THREE };

@@ -9,7 +9,7 @@ import {
 } from '@gittree/core';
 import { GROUND, SPECIMEN, hexToRgb } from '../palette.js';
 import { LeafSystem } from './leaves.js';
-import { LimbSystem, ringCenters } from './limbs.js';
+import { LimbSystem, ringCentersInto } from './limbs.js';
 import { PixelPass } from './pixelPass.js';
 import { TreeCamera } from './camera.js';
 import { MorphState } from './morph.js';
@@ -35,6 +35,9 @@ import type { BackendEvent, RenderBackend, RendererKind, TransitionOptions } fro
 
 /** How long a lost context is given to come back before we give up on the GPU. */
 const RESTORE_GRACE_MS = 6000;
+
+/** Width of the one-dimensional map of every ring boundary on the trunk. */
+const RING_TEXELS = 512;
 
 export class WebGLBackend implements RenderBackend {
   readonly kind: RendererKind = 'webgl';
@@ -65,6 +68,19 @@ export class WebGLBackend implements RenderBackend {
   private frameTimes: number[] = [];
   reduceMotion = false;
 
+  /**
+   * Scratch, sized once per repository. applyLayout runs on every growth
+   * keyframe — roughly eighteen times a second for the length of the intro —
+   * and on a large repository these three buffers come to well over a megabyte.
+   * Allocating them per call handed the collector that much garbage per
+   * keyframe, during the one animation the product exists for.
+   */
+  private centerScratch = new Float32Array(0);
+  private heightScratch = new Float32Array(0);
+  /** One per-leaf staging array, shared by every attribute write. */
+  private leafScratch = new Float32Array(0);
+  private readonly ringData = new Uint8Array(RING_TEXELS * 4);
+
   private handlers = new Set<(e: BackendEvent) => void>();
   private contextLost = false;
   private restoreTimer: ReturnType<typeof setTimeout> | null = null;
@@ -81,7 +97,7 @@ export class WebGLBackend implements RenderBackend {
     this.scene.background = new THREE.Color(GROUND[1]);
     this.cam = new TreeCamera(canvas.clientWidth / Math.max(1, canvas.clientHeight));
     this.palette = makePaletteTexture();
-    this.ringTex = makeRingTexture();
+    this.ringTex = makeRingTexture(this.ringData);
 
     canvas.addEventListener('webglcontextlost', this.handleLost, false);
     canvas.addEventListener('webglcontextrestored', this.handleRestored, false);
@@ -186,6 +202,10 @@ export class WebGLBackend implements RenderBackend {
     this.limbs.write('aDelay', limbDelay);
     this.limbs.write('aGhost', limbGhost);
 
+    this.centerScratch = new Float32Array(this.slots * segments * LIMB_RING_VERTS * 3);
+    this.heightScratch = new Float32Array(this.slots * segments * LIMB_RING_VERTS);
+    this.leafScratch = new Float32Array(leafCount);
+
     this.addGround();
     this.live = 'A';
     this.transitioning = false;
@@ -255,16 +275,17 @@ export class WebGLBackend implements RenderBackend {
       target,
       result.limbVertices,
       result.limbVisible,
-      ringCenters(result.limbVertices, this.slots, this.segments),
+      ringCentersInto(result.limbVertices, this.slots, this.segments, this.centerScratch),
     );
 
-    const limbHeight = new Float32Array(this.slots * this.segments * LIMB_RING_VERTS);
+    const limbHeight = this.heightScratch;
     const span = Math.max(1e-3, result.bounds.max[1] - result.bounds.min[1]);
     for (let s = 0; s < this.slots; s++) {
       for (let j = 0; j < this.segments; j++) {
-        const y = result.limbVertices[(s * this.segments + j) * LIMB_RING_VERTS * 3 + 1];
+        const ring = s * this.segments + j;
+        const y = result.limbVertices[ring * LIMB_RING_VERTS * 3 + 1];
         const h = (y - result.bounds.min[1]) / span;
-        limbHeight.fill(h, (s * this.segments + j) * LIMB_RING_VERTS, (s * this.segments + j + 1) * LIMB_RING_VERTS);
+        limbHeight.fill(h, ring * LIMB_RING_VERTS, (ring + 1) * LIMB_RING_VERTS);
       }
     }
     this.limbs.write('aHeight', limbHeight);
@@ -289,8 +310,9 @@ export class WebGLBackend implements RenderBackend {
   }
 
   private updateRings(rings: RingMark[]): void {
-    const w = 512;
-    const data = new Uint8Array(w * 4);
+    const w = RING_TEXELS;
+    const data = this.ringData;
+    data.fill(0);
     for (const r of rings) {
       const x = Math.round(Math.min(1, Math.max(0, r.t)) * (w - 1));
       const weight = r.major ? 255 : 96;
@@ -301,14 +323,13 @@ export class WebGLBackend implements RenderBackend {
         if (v > data[i * 4]) data[i * 4] = v;
       }
     }
-    this.ringTex.image.data = data;
     this.ringTex.needsUpdate = true;
   }
 
   setLens(attrs: LensAttributes): void {
     if (!this.leaves) return;
     const n = this.morph.leafCount;
-    const family = new Float32Array(n);
+    const family = this.leafScratch;
     for (let i = 0; i < n; i++) family[i] = attrs.family[i] ?? 1;
     this.leaves.write('aFamily', family);
     this.leaves.write('aTone', attrs.tone);
@@ -319,7 +340,7 @@ export class WebGLBackend implements RenderBackend {
   setFalling(falling: Float32Array, now: number): void {
     if (!this.leaves) return;
     const n = this.morph.leafCount;
-    const starts = new Float32Array(n);
+    const starts = this.leafScratch;
     for (let i = 0; i < n; i++) {
       // Stagger, so a thousand leaves do not release on the same frame.
       starts[i] = falling[i] > 0 ? now + ((i * 37) % 900) / 300 : 0;
@@ -329,14 +350,17 @@ export class WebGLBackend implements RenderBackend {
 
   clearFalling(): void {
     if (!this.leaves) return;
-    this.leaves.write('aFallStart', new Float32Array(this.morph.leafCount));
+    this.leafScratch.fill(0);
+    this.leaves.write('aFallStart', this.leafScratch);
   }
 
   /** Dim non-matching commits for search. Writes one attribute; moves nothing. */
   setDim(match: Set<string> | null): void {
     if (!this.leaves || !this.tree) return;
+    // Search runs this on every keystroke, so it stages through the shared
+    // scratch rather than allocating a fresh array per character typed.
     const n = this.morph.leafCount;
-    const dim = new Float32Array(n);
+    const dim = this.leafScratch;
     if (!match) dim.fill(1);
     else for (let i = 0; i < n; i++) dim[i] = match.has(this.tree.order[i]) ? 1 : 0.12;
     this.leaves.write('aDim', dim);
@@ -574,9 +598,8 @@ function makePaletteTexture(): THREE.DataTexture {
   return tex;
 }
 
-function makeRingTexture(): THREE.DataTexture {
-  const w = 512;
-  const tex = new THREE.DataTexture(new Uint8Array(w * 4), w, 1, THREE.RGBAFormat);
+function makeRingTexture(data: Uint8Array): THREE.DataTexture {
+  const tex = new THREE.DataTexture(data, RING_TEXELS, 1, THREE.RGBAFormat);
   tex.magFilter = THREE.LinearFilter;
   tex.minFilter = THREE.LinearFilter;
   tex.generateMipmaps = false;

@@ -1,5 +1,6 @@
 import type { Plugin } from 'vite';
 import type { Commit, RepoSnapshot } from '@gittree/core';
+import { FIRST_PAGE_COMMITS, PAGE_SIZE } from './api/_github.js';
 
 /* -------------------------------------------------------------------------- */
 /* Development API                                                             */
@@ -237,7 +238,22 @@ export function devApi(): Plugin {
           return;
         }
 
-        res.end(JSON.stringify({ snapshot: shapeFor(owner, name, url), cursor: null }));
+        // Paginated the way the real adapter is. Returning the whole history in
+        // one response made development pleasant and the measurements a lie:
+        // production sends a 300-commit first page and then hundreds, and the
+        // viewer ingests each one, so anything quadratic in the number of pages
+        // was invisible here and expensive there.
+        const full = shapeFor(owner, name, url);
+        const from = Number(url.searchParams.get('cursor') ?? 0);
+        const size = from === 0 ? FIRST_PAGE_COMMITS : PAGE_SIZE;
+        const slice = full.commits.slice(from, from + size);
+        const after = from + slice.length;
+        res.end(
+          JSON.stringify({
+            snapshot: { ...full, commits: slice },
+            cursor: after < full.commits.length ? String(after) : null,
+          }),
+        );
       });
     },
   };

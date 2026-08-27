@@ -246,9 +246,23 @@ export class LimbSystem {
   }
 }
 
-/** Ring centres, derived from the six vertices of each ring. */
-export function ringCenters(limbVertices: Float32Array, slots: number, segments: number): Float32Array {
-  const out = new Float32Array(slots * segments * LIMB_RING_VERTS * 3);
+/**
+ * Ring centres, derived from the six vertices of each ring, written into a
+ * buffer the caller owns. During growth this runs about eighteen times a
+ * second, and on a large repository the result is a megabyte; allocating it
+ * each time handed the collector a megabyte of garbage per keyframe for no
+ * reason, in the middle of the one animation the whole product is about.
+ *
+ * The vertex form (one centre repeated per ring vertex) is what the GPU
+ * backend's attribute stream wants. The 2D backend wants one centre per ring,
+ * which is `ringCentersCompact` below.
+ */
+export function ringCentersInto(
+  limbVertices: Float32Array,
+  slots: number,
+  segments: number,
+  out: Float32Array,
+): Float32Array {
   for (let r = 0; r < slots * segments; r++) {
     let cx = 0;
     let cy = 0;
@@ -267,6 +281,30 @@ export function ringCenters(limbVertices: Float32Array, slots: number, segments:
       out[base + k * 3 + 1] = cy;
       out[base + k * 3 + 2] = cz;
     }
+  }
+  return out;
+}
+
+/** One centre per ring rather than one per ring vertex. */
+export function ringCentersCompact(
+  limbVertices: Float32Array,
+  slots: number,
+  segments: number,
+  out: Float32Array,
+): Float32Array {
+  for (let r = 0; r < slots * segments; r++) {
+    let cx = 0;
+    let cy = 0;
+    let cz = 0;
+    const base = r * LIMB_RING_VERTS * 3;
+    for (let k = 0; k < LIMB_RING_VERTS; k++) {
+      cx += limbVertices[base + k * 3];
+      cy += limbVertices[base + k * 3 + 1];
+      cz += limbVertices[base + k * 3 + 2];
+    }
+    out[r * 3] = cx / LIMB_RING_VERTS;
+    out[r * 3 + 1] = cy / LIMB_RING_VERTS;
+    out[r * 3 + 2] = cz / LIMB_RING_VERTS;
   }
   return out;
 }

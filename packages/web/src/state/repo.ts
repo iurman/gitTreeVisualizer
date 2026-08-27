@@ -1,4 +1,4 @@
-import { RepoSnapshotSchema, type Commit, type RepoSnapshot } from '@gittree/core';
+import { parseSnapshot, type Commit, type RepoSnapshot } from '@gittree/core';
 
 /* -------------------------------------------------------------------------- */
 /* Repository access                                                           */
@@ -71,7 +71,7 @@ export async function* fetchRepo(ref: RepoRef, signal?: AbortSignal): AsyncGener
       throw new RepoError(body.error ?? 'That repository could not be read.', res.status, body.hint);
     }
     const data = (await res.json()) as Page;
-    const snap = RepoSnapshotSchema.parse(data.snapshot);
+    const snap = parseSnapshot(data.snapshot);
 
     if (!merged) {
       merged = snap;

@@ -27,7 +27,11 @@ export function App() {
   const ref = useMemo(() => parseRepoInput(route.replace(/^\//, '')), [route]);
 
   useEffect(() => {
-    if (ref) void viewer.load(ref);
+    if (!ref) return;
+    // Start the renderer download and the history fetch in the same tick. The
+    // fetch is the long pole, so the renderer arrives for free behind it.
+    viewer.preloadRenderer();
+    void viewer.load(ref);
   }, [ref?.owner, ref?.name, viewer]);
 
   return (
