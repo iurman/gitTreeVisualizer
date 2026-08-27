@@ -183,9 +183,12 @@ export class Viewer {
   mount(canvas: HTMLCanvasElement): void {
     try {
       this.renderer = new TreeRenderer(canvas);
-    } catch {
-      // No WebGL. The server-rendered silhouette takes over; this is a fallback,
-      // not an error screen.
+    } catch (e) {
+      // Usually no WebGL: Brave and Firefox both block it under fingerprinting
+      // protection. It can also be a genuine failure to build the renderer, and
+      // the two are indistinguishable from here, so the real error goes to the
+      // console rather than being swallowed behind the fallback's copy.
+      console.error('[tree] the renderer could not start', e);
       this.set({ webglFailed: true });
       return;
     }
