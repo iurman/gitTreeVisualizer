@@ -97,6 +97,7 @@ export class Viewer {
   private unfold = 1;
   private unfoldTarget = 1;
   private renderScale = 1;
+  private lastCameraPos = new THREE.Vector3();
   private abort: AbortController | null = null;
 
   private listeners = new Set<() => void>();
@@ -752,7 +753,13 @@ export class Viewer {
       r.setUnfold(this.unfold);
     }
 
-    if (this.current) this.sound.setCameraHeight(r.cam.heightFactor(this.current.bounds));
+    if (this.current) {
+      // How far the camera travelled this frame drives the ambient bed, so it
+      // is heard while orbiting or flying and not at all while the tree sits still.
+      const moved = r.cam.camera.position.distanceTo(this.lastCameraPos);
+      this.lastCameraPos.copy(r.cam.camera.position);
+      this.sound.setSpace(r.cam.heightFactor(this.current.bounds), moved);
+    }
     r.render(now);
 
     if (now % 500 < 17 && Math.abs(r.fps - this.state.fps) > 2) this.set({ fps: Math.round(r.fps) });

@@ -252,6 +252,11 @@ than scaling a small image up.
 It does not touch audio: they are separate concerns and conflating them takes
 a channel away from someone who wanted one and not the other.
 
+The ambient bed plays only while the camera is moving. Its purpose is to give
+travel a sense of space, so stillness closes it completely — a drone that runs
+from the moment audio unlocks until the tab closes is not barely present, it is
+just a drone, however quietly it is mixed.
+
 Sound is synthesized, quantized to a minor pentatonic on D, and mixed well
 below unity through a compressor and a limiter. It is a sonification, not a
 soundtrack: dense commit periods are dense, dormant years are near-silent, and

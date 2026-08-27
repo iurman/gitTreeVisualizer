@@ -22,10 +22,14 @@ const ROOT = 146.83; // D3
 const MAX_VOICES = 8;
 const MAX_TRIGGERS_PER_SECOND = 12;
 /**
- * The ambient bed is a bed. It has to stay under the ticks rather than become
- * the whole soundtrack, which is what it was at three times this level.
+ * The ambient bed exists to give orbiting a sense of space, so it plays while
+ * the camera is moving and is silent when it is not. A drone that runs from
+ * the moment audio unlocks until the tab closes is not "barely present", it is
+ * just a drone, however quiet it is made.
  */
-const AMBIENT_GAIN = 0.016;
+const AMBIENT_GAIN = 0.02;
+/** Camera movement per frame, in world units, at which the bed is fully open. */
+const MOTION_FULL = 1.6;
 
 export type VoiceKind =
   | 'leaf'
@@ -380,32 +384,49 @@ export class SoundEngine {
     const ctx = this.ctx;
     if (!ctx || !this.bus) return;
     const osc = ctx.createOscillator();
-    osc.type = 'sawtooth';
-    osc.frequency.value = ROOT / 4;
+    osc.type = 'triangle';
+    osc.frequency.value = ROOT / 2;
     const filter = ctx.createBiquadFilter();
     filter.type = 'lowpass';
-    filter.frequency.value = 180;
-    filter.Q.value = 1.4;
+    filter.frequency.value = 220;
+    filter.Q.value = 0.6;
     const gain = ctx.createGain();
-    gain.gain.value = 0.0;
+    // Opens only when the camera moves. Starts, and rests, at silence.
+    gain.gain.value = 0;
     osc.connect(filter).connect(gain).connect(this.bus);
     osc.start();
-    gain.gain.setTargetAtTime(AMBIENT_GAIN, ctx.currentTime, 2);
     this.ambient = { osc, filter, gain };
   }
 
   private lastHeight = -1;
+  private lastLevel = -1;
+  private motion = 0;
 
-  /** Filter cutoff tracks camera height, so orbiting has a sense of space. */
-  setCameraHeight(h: number): void {
+  /**
+   * Cutoff tracks camera height and level tracks camera movement, so travelling
+   * through the scene opens the bed up and stillness closes it. Called every
+   * frame, so both are guarded: a non-finite value would put NaN into a biquad,
+   * which does not fail quietly, and scheduling sixty automation events a second
+   * to describe a value that has not moved is pure waste.
+   */
+  setSpace(height: number, movedPerFrame: number): void {
     if (!this.ambient || !this.ctx) return;
-    // Called every frame. A non-finite height would put NaN into a biquad,
-    // which does not fail quietly, and scheduling sixty automation events a
-    // second to describe a value that has not moved is pure waste.
-    if (!Number.isFinite(h)) return;
-    if (Math.abs(h - this.lastHeight) < 0.01) return;
-    this.lastHeight = h;
-    this.ambient.filter.frequency.setTargetAtTime(140 + h * 620, this.ctx.currentTime, 0.3);
+    const now = this.ctx.currentTime;
+
+    if (Number.isFinite(movedPerFrame)) {
+      // Rise with movement, fall away over roughly a second of stillness.
+      this.motion = Math.max(movedPerFrame, this.motion * 0.93);
+      const level = AMBIENT_GAIN * Math.min(1, this.motion / MOTION_FULL);
+      if (Math.abs(level - this.lastLevel) > AMBIENT_GAIN * 0.04) {
+        this.lastLevel = level;
+        this.ambient.gain.gain.setTargetAtTime(level, now, 0.25);
+      }
+    }
+
+    if (Number.isFinite(height) && Math.abs(height - this.lastHeight) >= 0.01) {
+      this.lastHeight = height;
+      this.ambient.filter.frequency.setTargetAtTime(180 + height * 520, now, 0.3);
+    }
   }
 
   dispose(): void {
