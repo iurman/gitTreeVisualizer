@@ -149,7 +149,7 @@ pnpm build        # production build
 /apps/site        the Vercel deployment: viewer plus serverless routes
 ```
 
-`core` has one runtime dependency and no browser assumptions, so the same
+`core` has no runtime dependencies and no browser assumptions, so the same
 layout code runs in a worker, in a serverless function drawing a share image,
 and in a test with no DOM.
 
@@ -188,10 +188,88 @@ rather than timing out.
 - Sound is muted persistently through `localStorage`, muted while the tab is
   hidden, and always has a visible toggle.
 - Narrow viewports open flat, with orbit as an opt-in. Audio works.
-- Without WebGL, a server-rendered SVG of the same tree is shown, not an error
-  screen.
 - Loading is progressive: the first commits render while the rest stream. There
   is no blocking spinner.
+
+---
+
+## Browsers
+
+The tree is drawn by [Three.js](https://threejs.org). Three's `WebGLRenderer`
+has been WebGL 2 only since r163, so the GPU path is WebGL 2: **Chrome 56+,
+Edge 79+, Firefox 51+, Safari 15+, and every Chromium browser including Brave
+and Opera.** That is over 97% of browsers in use. WebGPU was considered and
+rejected — it is not in Firefox on Linux, not in Safari before 26, and still
+flagged off on a good deal of hardware, so it would cost reach rather than add
+it.
+
+The rest is not old browsers. It is current ones with WebGL switched off:
+Firefox and Brave both do it under fingerprinting protection, an enterprise
+policy or a blocklisted driver does it on machines that are otherwise fine, and
+a virtual desktop often has no GPU to offer at all. Those get a **software
+renderer** — the same tree, the same twenty-four colours, the same 480×270
+pixel grid, rasterized on the CPU. Growth, orbit, every view, every lens,
+clicking a commit and the timeline all work; what it drops is the ambient sway
+on limbs and per-pixel lighting on the bark, neither of which is legible at two
+pixels wide. It needs nothing but a canvas. A badge says which renderer is
+running, and `?renderer=2d` forces the software one on a machine that has a GPU.
+
+If the browser takes the graphics context away mid-session — which phones do
+under memory pressure, and a driver reset does on the desktop — the tree comes
+back when the context does. If it does not come back, the software renderer
+takes over rather than leaving a frozen canvas.
+
+Layout runs on a worker thread, and that is optional too. Module workers only
+reached Firefox in 114, and a content-security policy can forbid them outright;
+when one cannot be started the same layout code runs on the main thread
+instead. Growth gets choppy on a large repository and a badge says so. It draws
+the tree.
+
+**The floor.** With both fallbacks in place, what is actually required is a
+canvas and a browser new enough for the build target: **ES2022 and ES modules,
+which is Chrome and Edge 94, Firefox 93, Safari 15.4** — early 2022. Below
+Chrome 111 / Firefox 113 / Safari 16.2 the CSS `color-mix()` used for panel
+backgrounds is ignored, so some chrome loses its translucency; the tree is
+unaffected. Older than the floor and the page will not boot at all, which is a
+bundler target and could be lowered if it ever mattered.
+
+Verified by driving the real application: WebGL disabled, the worker blocked,
+both at once, and the graphics context taken away mid-session and not given
+back. All of that testing was in Chromium — the fallbacks are feature-detected
+rather than version-detected, so they do not depend on which engine is running,
+but Firefox and Safari have not been driven directly.
+
+---
+
+## Speed
+
+Measured on a throttled connection — 9 Mbps, 40 ms round trip, CPU at a quarter
+speed, roughly a mid-range phone on good 4G.
+
+| | before | after |
+|---|---|---|
+| First contentful paint | 13.5 s | 0.65 s |
+| Landing page | 1,240 kB, 11 requests | 380 kB, 9 requests |
+| JavaScript before first paint | 240 kB gzipped | 81 kB gzipped |
+| Tree laid out, 1,400 commits | — | 2.2 s |
+
+The 13.5 seconds was not a heavy page. Every local asset arrived in 59 ms and
+the browser then painted nothing while it waited on a render-blocking
+`@import` of a Google Fonts stylesheet that never resolved. The faces are
+self-hosted now, and nothing on the critical path leaves this origin.
+
+Three.js is half a megabyte and the landing page has no canvas, so it is loaded
+on demand — requested the moment a repository route is known, which puts it
+alongside the first page of history instead of in front of it. The layout
+worker is spawned on the same trigger. The snapshot validator is hand-written
+rather than a schema library, which took a quarter of a megabyte of source out
+of the bundle and left `core` with no dependencies at all.
+
+During growth, nothing allocates: the buffers the layout writes into are sized
+once per repository rather than per keyframe. The software renderer fills its
+palette table on demand instead of building all 32,768 entries before the first
+frame, and steps its edge functions across a scanline rather than recomputing
+them per pixel — together, 14.4 ms a frame down to 9.5.
 
 ---
 

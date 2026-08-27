@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildTopology } from './topology.js';
-import { parseSnapshot, TopologyError } from './types.js';
+import { TopologyError } from './types.js';
+import { parseSnapshot } from './snapshot.js';
 import * as f from './__fixtures__/dags.js';
 
 const trunkOf = (t: ReturnType<typeof buildTopology>) => t.limbs[0];

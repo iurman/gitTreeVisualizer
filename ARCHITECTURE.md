@@ -24,7 +24,7 @@ has been broken.
   /site        vercel deployment: the viewer plus serverless routes.
 ```
 
-`core` has one runtime dependency (zod) and imports nothing that assumes a
+`core` has no runtime dependencies at all and imports nothing that assumes a
 browser. That is what lets the same layout code run in a worker, in a Node
 serverless function drawing a share image, and in a unit test with no DOM.
 
@@ -32,10 +32,18 @@ serverless function drawing a share image, and in a unit test with no DOM.
 
 ## 1. The adapter boundary
 
-`core/src/types.ts` defines `RepoSnapshot` and validates it with zod. Every
-source parses through `parseSnapshot` at the seam, so malformed data fails
-where the stack trace still points at the source rather than deep inside a
-layout function.
+`core/src/types.ts` defines `RepoSnapshot` as plain types and
+`core/src/snapshot.ts` checks it. Every source parses through `parseSnapshot`
+at the seam, so malformed data fails where the stack trace still points at the
+source rather than deep inside a layout function.
+
+The check was a Zod schema, and Zod was the single largest thing in the browser
+bundle: about 250 kB of source, including a JSON-Schema exporter this project
+never calls, shipped to validate a response from an API in this same
+repository. A schema library earns that when the shape is negotiated with
+someone else or changes often. This one is neither — eleven fields, ours at
+both ends — so it is a hand-written check that reports the path of the first
+field that does not hold up, and `core` has no dependencies.
 
 ```ts
 type RepoSnapshot = {
@@ -225,7 +233,115 @@ range grows only that range.
 
 ---
 
-## 4. The morph system
+## 4. Two renderers
+
+`web/src/render/backend.ts` is the whole contract. Above it, nothing knows how
+the tree is drawn; below it there are two implementations of `RenderBackend`.
+
+| | `WebGLBackend` | `Canvas2DBackend` |
+|---|---|---|
+| Drawn by | Three.js on WebGL 2 | a software rasterizer on a 2D context |
+| Cost | two draw calls, all morphing on the GPU | ~10 ms a frame at 1,400 commits |
+| Gives up | nothing | ambient sway on limbs, per-pixel bark lighting, the higher render scale while flying |
+| Needs | a WebGL 2 context | a canvas |
+
+**Three.js is the 3D stack, and was already.** Three's `WebGLRenderer` has been
+WebGL 2 only since r163, so "use Three.js" and "target WebGL 2" are the same
+decision. WebGL 2 is Chrome 56, Edge 79, Firefox 51 and Safari 15 — over 97% of
+browsers. Three's `WebGPURenderer` would be a step backwards on reach, not
+forwards: WebGPU is not in Firefox on Linux, not in Safari before 26, and is
+still disabled behind flags on a good deal of hardware.
+
+What is left over after 97% is not old browsers. It is current ones with WebGL
+switched off: Firefox and Brave both do it under fingerprinting protection, an
+enterprise policy or a blocklisted driver does it on machines that are
+otherwise fine, and a virtual desktop often has no GPU to offer. That is why
+the second backend is a renderer and not an apology — the old fallback was a
+static SVG drawn on the server, which has no growth, no orbit, no lenses and no
+clicking a commit.
+
+Three.js is still doing the arithmetic in the fallback. `Matrix4`,
+`PerspectiveCamera` and `Raycaster` have no WebGL dependency, so `camera.ts`
+and `morph.ts` are literally the same code under both backends. Only the
+drawing differs.
+
+### Choosing
+
+`capabilities.ts` asks for a WebGL 2 context and reports what came back. No
+user-agent parsing: the browsers that matter here are exactly the ones that
+lie about who they are, or that report a stock Chrome build with WebGL disabled
+behind a shield. The probe context is released through `WEBGL_lose_context`,
+because browsers cap live contexts per page and a leaked probe can cost the
+real renderer its own.
+
+`?renderer=2d` forces the software path and `?renderer=webgl` forces the GPU
+one, which is how the fallback gets exercised on a machine that has a GPU.
+
+### Losing the context
+
+Not an edge case. Mobile Safari and Chrome both drop contexts under memory
+pressure, a driver reset takes one out on the desktop, and a GPU process crash
+takes out every context on the page. `webglcontextlost` is preventDefault-ed so
+the browser will hand one back, and on `webglcontextrestored` **nothing is
+rebuilt**: Three recreates every GPU-side cache and re-uploads each buffer from
+the JavaScript array that owns it on the next frame. Rebuilding would hand the
+new context handles belonging to the old one, which is a screenful of
+`INVALID_OPERATION` and no benefit. Only the settings held on the renderer
+rather than in a resource — pixel ratio, output colour space, clear colour —
+are re-applied.
+
+If the context does not come back within six seconds, the viewer swaps to the
+software renderer rather than leaving a frozen canvas that looks like a hang.
+A canvas holds exactly one kind of context for its whole life, so the swap
+bumps a generation counter, React hands back a fresh `<canvas>`, and the normal
+mount path runs again.
+
+### The worker is optional as well
+
+The renderer is not the only thing a browser can decline. Layout runs on a
+module worker, and module workers only reached Firefox in 114 — years after
+WebGL 2 — so for a while the *narrowest* requirement in this application was
+not the one the two renderers were built for. A content-security policy can
+forbid workers outright, and a script can simply fail to fetch.
+
+That case used to fail silently and terminally: nothing resolved the ready
+promise, every layout awaited forever, and the seed screen sat there for good
+with nothing in the console — the exact failure mode the renderer fallback
+exists to prevent. `LayoutEngine` is now the whole of what the worker does,
+with no reference to workers in it, so `LayoutClient` can run it on the main
+thread instead. It falls through on a constructor throw, on `onerror`, and on a
+four-second timeout for the failures that produce no event at all. Growth is
+choppy on a large repository and a badge says so.
+
+With both fallbacks, the floor is a canvas plus the build target: ES2022 and ES
+modules, which is Chrome and Edge 94, Firefox 93, Safari 15.4. `color-mix()`
+below Chrome 111 / Firefox 113 / Safari 16.2 costs some panel translucency and
+nothing else.
+
+### One picture, two ways of drawing it
+
+Both backends draw into the same 480×270 grid and quantize to the same
+twenty-four colours, so the fallback is a quieter version of the same picture
+rather than a different product. The rasterizer holds a palette index per pixel
+rather than RGB, resolved at write time through a 5-bit-per-channel lookup
+table built once, and stores **reciprocal** depth: 1/z is the only quantity
+that interpolates linearly in screen space, and the ground plate — seen almost
+edge on, spanning a thousand units of depth in a few dozen rows — is exactly
+the shape that gets visibly wrong ordering otherwise.
+
+A limb is a screen-space ribbon shaded in five strips across its width, with
+the tube normal reconstructed from how far across each strip sits: a point `u`
+of the way to the edge has a normal `u` across and `sqrt(1 - u²)` toward the
+camera. That is the normal the shader would compute, so the two agree as the
+camera orbits rather than only at one angle. Below a couple of pixels the limb
+takes the *average* across the tube instead of the value at its centre, because
+a one-pixel limb shows its whole visible half in that pixel — taking the centre
+hands every thin limb the brightest normal there is whenever the key light is
+behind the viewer, which turns a distant canopy into white wire.
+
+---
+
+## 5. The morph system
 
 `web/src/render/`. Two systems, both morphable, both built once.
 
@@ -306,7 +422,21 @@ less than maintaining those matrices would.
 Scene renders into a `WebGLRenderTarget` around 480 by 270, nearest filtering
 both ways, no mipmaps, no antialiasing. A post pass quantizes to the 24-colour
 palette by nearest match **in linear space**, with a 4×4 Bayer dither to break
-banding.
+banding. The Bayer matrix is evaluated rather than looked up: a
+`float[16](...)` initializer is GLSL ES 3.00 syntax, and it only compiled at all
+because Three silently rewrites every `ShaderMaterial` to `#version 300 es` —
+an internal detail of one library version, in the one file whose job is to be
+portable.
+
+Leaf size is computed in whole render-target pixels, not whole world units.
+`uPixelScale` is how many world units one pixel spans at unit depth; multiplying
+by a leaf's own depth gives the size of a pixel where that leaf actually is.
+Clamping that ratio between 1 and 9 pixels is what stops a forty-commit
+repository drawing its whole history below one pixel and a fly-to filling the
+frame with a single diamond — both were the same bug, a size fixed in world
+units applied as a view-space offset. Snapping it to a whole pixel is what
+stops a leaf rendering as a half-lit smear. `leafSize.ts` holds the numbers and
+both backends use them.
 
 Vertex positions snap to the low-resolution grid in clip space before the
 perspective divide:
@@ -326,7 +456,76 @@ fonts.
 
 ---
 
-## 5. Adding a feature
+## 6. The load path
+
+Measured on a throttled connection (9 Mbps, 40 ms RTT, CPU at a quarter speed),
+which is roughly a mid-range phone on good 4G.
+
+| | before | after |
+|---|---|---|
+| First contentful paint | 13.5 s | 0.65 s |
+| Landing page transfer | 1,240 kB over 11 requests | 380 kB over 9 |
+| Eager JavaScript | 240 kB gzipped | 81 kB gzipped |
+| Layout worker bundle | 94 kB | 25 kB |
+| Tree laid out, 1,400 commits | — | 2.2 s |
+
+Four things were wrong, in descending order of how much they mattered.
+
+**The fonts blocked everything.** `styles.css` opened with an `@import` of a
+Google Fonts stylesheet. A remote `@import` is render-blocking and serially
+chained: fetch our CSS, parse it, discover the import, fetch Google's CSS,
+parse that, discover the woff2 URLs, fetch those. Worse than slow, it is a
+single point of failure on a third party. In the environment this was measured
+in, `fonts.googleapis.com` was unreachable; every local asset landed in 59 ms
+and the page then painted **nothing at all for 12.7 seconds** waiting for the
+connection to be reset. That is not a hypothetical — the same thing happens on
+corporate networks that block the domain. The faces are now self-hosted, hashed
+into `/assets` behind the immutable cache header, latin and latin-ext only, and
+a build plugin preloads the three regular faces so they start downloading with
+the HTML rather than after the stylesheet parses.
+
+**Three.js was on the critical path.** Half a megabyte, fetched and parsed
+before anything rendered, including on the landing page which has no canvas.
+`render/load.ts` is now the seam: it imports only types, so it sits in the eager
+bundle while everything behind it is a lazy chunk. The interface asks for that
+chunk the moment it knows a repository is being opened, so it downloads
+alongside the first page of history rather than in front of it — the fetch is
+the long pole either way. The layout worker is spawned on the same trigger for
+the same reason.
+
+**Zod shipped to the browser.** Covered above; it also took the worker bundle
+from 94 kB to 25 kB, since the worker imports `core` too.
+
+**The growth animation allocated.** `applyLayout` runs on every keyframe, about
+eighteen times a second for the length of the intro, and it allocated fresh
+typed arrays for limb heights, ring centres and the ring texture every time —
+over a megabyte per keyframe on a large repository, during the one animation
+the product exists for. They are scratch buffers sized once per repository now.
+The per-leaf attribute writes (lens, dim, falling) share one staging array,
+which matters most for search, where `setDim` ran once per keystroke.
+
+### The software rasterizer
+
+Two changes, both measured by `render/bench.bench.test.ts`:
+
+- **The palette lookup table fills on demand.** Building all 32,768 cells up
+  front is 786,000 distance computations — 38 ms on a fast desktop and several
+  hundred on a phone, blocking the first frame on exactly the machines most
+  likely to be running the software renderer at all. A tree touches a few
+  hundred distinct cells.
+- **Barycentrics are stepped, not recomputed.** They are affine in screen
+  space, so six multiplies per pixel become two additions. With the per-pixel
+  dither offset precomputed alongside the vignette, a frame went from 14.4 ms
+  to 9.5 ms — a 70 fps ceiling to 105.
+
+Both are the kind of change that silently corrupts output, so
+`render.test.ts` checks the stepped edge functions against a direct evaluation
+of the same formula, pixel for pixel, across five awkward triangles including
+one that extends far off-screen.
+
+---
+
+## 7. Adding a feature
 
 The test of this architecture is that new features are layout functions or
 attribute writes, never renderer changes.
@@ -345,7 +544,7 @@ thousands of them cost nothing. Both move zero vertices on the CPU.
 
 ---
 
-## 6. The serverless layer
+## 8. The serverless layer
 
 `apps/site/api/`.
 
@@ -355,7 +554,9 @@ thousands of them cost nothing. Both move zero vertices on the CPU.
   copy. `parents(first: 8)`, not 2, because octopus merges are legal. Capped at
   2,000 commits, `s-maxage=3600, stale-while-revalidate=86400`, per-IP rate
   limited so someone scripting random repositories burns their own budget.
-- `silhouette/[owner]/[name].ts` — the flat SVG, for browsers without WebGL.
+- `silhouette/[owner]/[name].ts` — the flat SVG. Now only reached when a
+  browser refuses a 2D canvas as well as WebGL, which is rare enough to be worth
+  saying plainly; its main job is the share card below.
 - `og.ts` — the share card. The same SVG, rasterized to PNG by resvg.
 
 The card carries no text. Every platform renders `og:title` and `og:description`
@@ -368,8 +569,8 @@ an unsupported external for Edge Functions, and its Node build wants both
 
 The SVG renderer lives in `core` and reads the same `LayoutResult` the GPU
 does, so a share card is the same tree, at the same window and granularity, as
-the link it points at. It is the WebGL fallback and the share image from one
-piece of code because they are the same picture.
+the link it points at. It is the last-resort fallback and the share image from
+one piece of code because they are the same picture.
 
 The token is server-side only and never reaches the client. `GITTREE_LIVE=1` is
 required to use it in development, so an ambient `GITHUB_TOKEN` in a shell —

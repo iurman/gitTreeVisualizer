@@ -1,4 +1,3 @@
-import * as THREE from 'three';
 import {
   SearchIndex,
   autoRingUnit,
@@ -21,13 +20,18 @@ import {
   type TimeWindow,
   type TreeStructure,
 } from '@gittree/core';
-import { TreeRenderer } from '../render/Renderer.js';
+import { loadRenderStack, prefetchRenderStack } from '../render/load.js';
+import { detectRenderCapabilities, type RenderCapabilities } from '../render/capabilities.js';
+import type { RendererSelection } from '../render/createRenderer.js';
+import type { BackendEvent, RenderBackend, RendererKind } from '../render/backend.js';
 import { GrowthSonifier, SoundEngine, type GrowthEvent } from '../audio/engine.js';
 import { LayoutClient } from './layoutClient.js';
 import { buildUrl, readUrl, writeUrl } from './url.js';
 import { fetchRepo, RepoError, type RepoRef } from './repo.js';
 
 export type Phase = 'idle' | 'loading' | 'seed' | 'growing' | 'ready' | 'error';
+
+type RenderStackFactory = (canvas: HTMLCanvasElement, caps?: RenderCapabilities) => RendererSelection;
 
 export type ViewerState = {
   phase: Phase;
@@ -69,7 +73,18 @@ export type ViewerState = {
   reduceMotion: boolean;
   orbitEnabled: boolean;
   narrow: boolean;
-  webglFailed: boolean;
+  /** Which renderer is drawing, or null before the canvas mounts. */
+  renderer: RendererKind | null;
+  /** Why the GPU renderer is not being used, when it is not. */
+  rendererNote: string | null;
+  /** True only when no renderer at all could be started. */
+  rendererFailed: boolean;
+  /** Bumped to make the interface hand us a fresh canvas. */
+  rendererGeneration: number;
+  /** The GPU context is gone and we are waiting to see whether it comes back. */
+  contextLost: boolean;
+  /** Layout is running on the main thread because no worker could be had. */
+  layoutOnMainThread: boolean;
   fps: number;
 };
 
@@ -77,7 +92,18 @@ const GROWTH_SECONDS = (commits: number) => Math.min(26, Math.max(9, 6 + commits
 const KEYFRAME_MS = 55;
 
 export class Viewer {
-  private renderer: TreeRenderer | null = null;
+  private renderer: RenderBackend | null = null;
+  /** Set once a backend has proved itself unusable, so we never retry it. */
+  private forcedKind: RendererKind | null = null;
+  /** Why we stopped using the GPU, kept across the remount that swaps renderers. */
+  private demotionReason: string | null = null;
+  /**
+   * Bumped by every mount and unmount. The renderer arrives asynchronously now,
+   * and React mounts the canvas twice in development, so a load that resolves
+   * after its canvas has gone has to know to throw the result away rather than
+   * attach a renderer to a detached element.
+   */
+  private mountToken = 0;
   private sound = new SoundEngine();
   private sonifier = new GrowthSonifier();
   private layoutClient = new LayoutClient();
@@ -97,7 +123,13 @@ export class Viewer {
   private unfold = 1;
   private unfoldTarget = 1;
   private renderScale = 1;
-  private lastCameraPos = new THREE.Vector3();
+  /**
+   * Three plain numbers rather than a Vector3: this module deliberately does
+   * not import Three, so that half a megabyte stays off the critical path and
+   * out of the landing page. A subtraction and a hypot is the whole of what a
+   * Vector3 would have been used for here.
+   */
+  private lastCameraPos: [number, number, number] = [0, 0, 0];
   private abort: AbortController | null = null;
 
   private listeners = new Set<() => void>();
@@ -139,12 +171,18 @@ export class Viewer {
     reduceMotion: false,
     orbitEnabled: true,
     narrow: false,
-    webglFailed: false,
+    renderer: null,
+    rendererNote: null,
+    rendererFailed: false,
+    rendererGeneration: 0,
+    contextLost: false,
+    layoutOnMainThread: false,
     fps: 60,
   };
 
   constructor() {
     this.snapshotCache = this.state;
+    this.layoutClient.observeFallback(() => this.set({ layoutOnMainThread: true }));
     const stored = readStored();
     this.state = { ...this.state, muted: stored.muted, volume: stored.volume };
     this.sound.setMuted(stored.muted);
@@ -181,28 +219,128 @@ export class Viewer {
   /* Mount                                                                  */
   /* ---------------------------------------------------------------------- */
 
+  /**
+   * Start downloading the renderer without waiting for it. Called as soon as a
+   * repository route is known, so the chunk arrives alongside the first page of
+   * history rather than after it.
+   */
+  preloadRenderer(): void {
+    prefetchRenderStack();
+    // Same reasoning for the layout worker: it is spawned on demand so the
+    // landing page does not pay for it, and a repository route wants it warm
+    // before the first page of history lands.
+    this.layoutClient.warm();
+  }
+
   mount(canvas: HTMLCanvasElement): void {
+    const token = ++this.mountToken;
+    void this.startRenderer(canvas, token);
+  }
+
+  private async startRenderer(canvas: HTMLCanvasElement, token: number): Promise<void> {
+    let createRenderer: RenderStackFactory;
     try {
-      this.renderer = new TreeRenderer(canvas);
+      ({ createRenderer } = await loadRenderStack());
     } catch (e) {
-      // Usually no WebGL: Brave and Firefox both block it under fingerprinting
-      // protection. It can also be a genuine failure to build the renderer, and
-      // the two are indistinguishable from here, so the real error goes to the
-      // console rather than being swallowed behind the fallback's copy.
-      console.error('[tree] the renderer could not start', e);
-      this.set({ webglFailed: true });
+      console.error('[tree] the renderer could not be downloaded', e);
+      if (token === this.mountToken) {
+        this.set({ rendererFailed: true, renderer: null, rendererNote: (e as Error)?.message ?? null });
+      }
       return;
     }
+    // Unmounted, or remounted onto a different canvas, while the chunk loaded.
+    if (token !== this.mountToken) return;
+
+    const caps: RenderCapabilities = {
+      ...detectRenderCapabilities(),
+      // A backend that has already failed on this page is never offered again.
+      ...(this.forcedKind ? { forced: this.forcedKind } : {}),
+    };
+
+    let selection: RendererSelection;
+    try {
+      selection = createRenderer(canvas, caps);
+    } catch (e) {
+      const message = (e as Error)?.message ?? 'unknown error';
+      // A canvas holds exactly one kind of context for its whole life. If WebGL
+      // claimed this one and then failed, no 2D context will ever be granted on
+      // it, and the only way forward is a different element — which is what the
+      // generation bump asks the interface for.
+      if (this.forcedKind !== 'canvas2d') {
+        console.warn('[tree] the GPU renderer would not start, asking for a fresh canvas:', e);
+        this.demoteToSoftware(message);
+        return;
+      }
+      // Both backends refused. That takes a browser with WebGL blocked *and*
+      // canvas drawing blocked, which is rare enough to be worth saying plainly
+      // rather than papering over; the real error goes to the console.
+      console.error('[tree] no renderer could be started', e);
+      this.set({ rendererFailed: true, renderer: null, rendererNote: message });
+      return;
+    }
+
+    this.renderer = selection.backend;
+    this.set({
+      renderer: selection.kind,
+      // A demotion carries its own reason across the remount; the factory only
+      // knows about failures it saw itself.
+      rendererNote: selection.degradedReason ?? this.demotionReason,
+      rendererFailed: false,
+      contextLost: false,
+    });
+    this.renderer.onEvent(this.onBackendEvent);
+
     // A handle for poking at the running viewer from a console or a test. It is
     // set on mount, not construction, so it is always the instance on screen.
     (window as unknown as { __viewer?: Viewer }).__viewer = this;
     this.renderer.setReduceMotion(this.state.reduceMotion);
-    this.resize(canvas.clientWidth, canvas.clientHeight);
+    this.resize(canvas.clientWidth || this.pendingSize[0], canvas.clientHeight || this.pendingSize[1]);
     // The canvas can mount after the data has already arrived, and in
     // development it mounts twice. Either way the renderer is rebuilt from the
     // state the viewer already holds rather than waiting for another fetch.
     this.rehydrateRenderer();
     this.loop();
+  }
+
+  /**
+   * A lost GPU context is not an error state on its own — the browser usually
+   * hands one back within a second or two, and Three re-uploads everything from
+   * the arrays it already holds. It becomes an error only when the context does
+   * not come back, and then the answer is the other renderer rather than a
+   * frozen canvas that looks like a hang.
+   */
+  private onBackendEvent = (e: BackendEvent): void => {
+    if (e.type === 'contextLost') {
+      this.set({ contextLost: true });
+      return;
+    }
+    if (e.type === 'contextRestored') {
+      // Nothing to rewrite: the backend's buffers are JavaScript arrays and
+      // Three re-uploads all of them on the next frame. Rebuilding here would
+      // hand the new context handles belonging to the old one.
+      this.set({ contextLost: false });
+      return;
+    }
+    console.warn(`[tree] the GPU renderer gave up: ${e.reason}`);
+    this.demoteToSoftware(e.reason);
+  };
+
+  /**
+   * Hand the work to the software renderer. A canvas can only ever have one
+   * kind of context, so the interface has to give us a new element; bumping the
+   * generation is what asks for it, and the remount runs the normal path.
+   */
+  private demoteToSoftware(reason: string): void {
+    if (this.forcedKind === 'canvas2d') return;
+    this.forcedKind = 'canvas2d';
+    this.demotionReason = reason;
+    this.unmount();
+    this.set({
+      renderer: null,
+      rendererNote: reason,
+      contextLost: false,
+      rendererGeneration: this.state.rendererGeneration + 1,
+    });
   }
 
   private rehydrateRenderer(): void {
@@ -217,7 +355,11 @@ export class Viewer {
     if (this.state.selected) r.setHighlight(this.tree.indexOf.get(this.state.selected) ?? -1, -1);
   }
 
+  /** The last size the interface reported, for a renderer that arrives after it. */
+  private pendingSize: [number, number] = [1, 1];
+
   resize(w: number, h: number): void {
+    this.pendingSize = [w, h];
     this.renderer?.resize(w, h);
     if (this.current) this.renderer?.cam.frame(this.current.bounds, w / Math.max(1, h));
   }
@@ -229,6 +371,7 @@ export class Viewer {
    * lay out.
    */
   unmount(): void {
+    this.mountToken++;
     cancelAnimationFrame(this.raf);
     this.raf = 0;
     this.renderer?.dispose();
@@ -537,7 +680,7 @@ export class Viewer {
   private applyBounds(result: LayoutResult): void {
     const r = this.renderer;
     if (!r) return;
-    const el = r.renderer.domElement;
+    const el = r.canvas;
     r.cam.frame(result.bounds, el.clientWidth / Math.max(1, el.clientHeight));
     r.setGroundY(result.bounds.min[1]);
   }
@@ -756,8 +899,15 @@ export class Viewer {
     if (this.current) {
       // How far the camera travelled this frame drives the ambient bed, so it
       // is heard while orbiting or flying and not at all while the tree sits still.
-      const moved = r.cam.camera.position.distanceTo(this.lastCameraPos);
-      this.lastCameraPos.copy(r.cam.camera.position);
+      const p = r.cam.camera.position;
+      const moved = Math.hypot(
+        p.x - this.lastCameraPos[0],
+        p.y - this.lastCameraPos[1],
+        p.z - this.lastCameraPos[2],
+      );
+      this.lastCameraPos[0] = p.x;
+      this.lastCameraPos[1] = p.y;
+      this.lastCameraPos[2] = p.z;
       this.sound.setSpace(r.cam.heightFactor(this.current.bounds), moved);
     }
     r.render(now);
@@ -799,6 +949,7 @@ export class Viewer {
       bounds: this.current?.bounds ?? null,
       visibleLeaves: this.current ? [...this.current.leafScales].filter((v) => v > 0).length : 0,
       visibleLimbs: this.current ? [...this.current.limbVisible].filter((v) => v > 0).length : 0,
+      renderer: r?.kind ?? null,
       camera: r ? { pos: r.cam.camera.position.toArray(), fov: r.cam.camera.fov, target: r.cam.target.toArray() } : null,
       fps: r?.fps ?? 0,
     };
@@ -847,5 +998,3 @@ function writeStored(s: Stored): void {
     /* private mode; the toggle still works for this session */
   }
 }
-
-export { THREE };

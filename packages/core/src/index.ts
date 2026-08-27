@@ -1,4 +1,5 @@
 export * from './types.js';
+export * from './snapshot.js';
 export * from './topology.js';
 export * from './layout.js';
 export * from './time.js';

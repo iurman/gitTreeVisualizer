@@ -1,46 +1,46 @@
 import * as THREE from 'three';
 import {
   LIMB_RING_VERTS,
-  MAX_LEAVES,
   limbSlotCount,
   type LayoutResult,
   type LensAttributes,
   type RingMark,
   type TreeStructure,
 } from '@gittree/core';
-import { GROUND, PALETTE, SPECIMEN, hexToRgb } from '../palette.js';
+import { GROUND, SPECIMEN, hexToRgb } from '../palette.js';
 import { LeafSystem } from './leaves.js';
-import { LimbSystem, ringCenters } from './limbs.js';
+import { LimbSystem, ringCentersInto } from './limbs.js';
 import { PixelPass } from './pixelPass.js';
 import { TreeCamera } from './camera.js';
+import { MorphState } from './morph.js';
+import { LENS_ROWS } from './lensPalette.js';
+import { LEAF_HEADROOM, LEAF_MAX_PX, LEAF_MIN_PX } from './leafSize.js';
+import type { BackendEvent, RenderBackend, RendererKind, TransitionOptions } from './backend.js';
 
 /* -------------------------------------------------------------------------- */
-/* The renderer                                                                */
+/* The GPU renderer                                                            */
 /*                                                                            */
 /* It never rebuilds geometry to change a view. Growth, the unfold, sorting,   */
 /* filtering and scrubbing are all the same operation: write the target layout */
 /* into the idle attribute set and animate one uniform. Geometry is built once */
-/* per repository and then only ever interpolated.                             */
+/* per repository and then only ever interpolated.                            */
 /*                                                                            */
 /* The A and B attribute sets alternate rather than being copied back, so a    */
-/* transition costs one buffer upload and nothing per frame.                   */
+/* transition costs one buffer upload and nothing per frame.                  */
+/*                                                                            */
+/* Three's WebGLRenderer has been WebGL2-only since r163, so this class is a   */
+/* WebGL2 renderer whether or not it says so. Everything it cannot serve goes  */
+/* to Canvas2DBackend instead; see createRenderer.ts for how that is decided.  */
 /* -------------------------------------------------------------------------- */
 
-const LENS_ROWS = [
-  // Decay: specimen shadow running into iron oxide.
-  ['#1E2C3A', '#324152', '#4C5A6A', '#A8482E', '#A8482E', '#D9714B', '#D9714B', '#D9714B'],
-  // The specimen ramp itself.
-  [...SPECIMEN],
-  // Categorical: every reagent the process has, spaced for maximum separation.
-  ['#2FA98C', '#D6C356', '#D9714B', '#4C82B6', '#5CCBAE', '#A99A3C', '#A8482E', '#38689A'],
-];
+/** How long a lost context is given to come back before we give up on the GPU. */
+const RESTORE_GRACE_MS = 6000;
 
-export type TransitionOptions = {
-  duration?: number;
-  onDone?: () => void;
-};
+/** Width of the one-dimensional map of every ring boundary on the trunk. */
+const RING_TEXELS = 512;
 
-export class TreeRenderer {
+export class WebGLBackend implements RenderBackend {
+  readonly kind: RendererKind = 'webgl';
   readonly renderer: THREE.WebGLRenderer;
   readonly scene = new THREE.Scene();
   readonly cam: TreeCamera;
@@ -52,36 +52,42 @@ export class TreeRenderer {
   private palette: THREE.DataTexture;
   private ringTex: THREE.DataTexture;
 
+  private morph = new MorphState();
   private tree: TreeStructure | null = null;
   private slots = 0;
   private segments = 22;
-  private leafCount = 0;
 
   /** Which attribute set currently holds the live layout. */
   private live: 'A' | 'B' = 'A';
-  private progress = 1;
   private transitionStart = 0;
   private transitionDuration = 900;
   private transitioning = false;
   private onTransitionDone: (() => void) | null = null;
 
-  private current: LayoutResult | null = null;
-  private previous: LayoutResult | null = null;
-  /** World positions at the current morph value, for picking. */
-  private pickPositions = new Float32Array(0);
-  private pickDirty = true;
-
-  private clock = new THREE.Clock();
+  private lastFrame = 0;
   private frameTimes: number[] = [];
   reduceMotion = false;
 
+  /**
+   * Scratch, sized once per repository. applyLayout runs on every growth
+   * keyframe — roughly eighteen times a second for the length of the intro —
+   * and on a large repository these three buffers come to well over a megabyte.
+   * Allocating them per call handed the collector that much garbage per
+   * keyframe, during the one animation the product exists for.
+   */
+  private centerScratch = new Float32Array(0);
+  private heightScratch = new Float32Array(0);
+  /** One per-leaf staging array, shared by every attribute write. */
+  private leafScratch = new Float32Array(0);
+  private readonly ringData = new Uint8Array(RING_TEXELS * 4);
+
+  private handlers = new Set<(e: BackendEvent) => void>();
+  private contextLost = false;
+  private restoreTimer: ReturnType<typeof setTimeout> | null = null;
+  private disposed = false;
+
   constructor(canvas: HTMLCanvasElement) {
-    this.renderer = new THREE.WebGLRenderer({
-      canvas,
-      antialias: false,
-      alpha: false,
-      powerPreference: 'high-performance',
-    });
+    this.renderer = createGLRenderer(canvas);
     // The scene is rendered into a fixed low-resolution target, so the device
     // pixel ratio only affects the final nearest-neighbour blit.
     this.renderer.setPixelRatio(1);
@@ -91,7 +97,71 @@ export class TreeRenderer {
     this.scene.background = new THREE.Color(GROUND[1]);
     this.cam = new TreeCamera(canvas.clientWidth / Math.max(1, canvas.clientHeight));
     this.palette = makePaletteTexture();
-    this.ringTex = makeRingTexture([]);
+    this.ringTex = makeRingTexture(this.ringData);
+
+    canvas.addEventListener('webglcontextlost', this.handleLost, false);
+    canvas.addEventListener('webglcontextrestored', this.handleRestored, false);
+  }
+
+  get canvas(): HTMLCanvasElement {
+    return this.renderer.domElement as HTMLCanvasElement;
+  }
+
+  onEvent(handler: (e: BackendEvent) => void): void {
+    this.handlers.add(handler);
+  }
+
+  private emit(e: BackendEvent): void {
+    for (const h of this.handlers) h(e);
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Context loss                                                           */
+  /*                                                                        */
+  /* Not an edge case. Mobile Safari and Chrome both drop contexts under     */
+  /* memory pressure, a driver reset takes one out on the desktop, and a GPU */
+  /* process crash takes out every context on the page. Three restores its   */
+  /* own GL state; what it cannot know is that our geometry came from a      */
+  /* worker, so the viewer is asked to write it again. If the context never  */
+  /* comes back, the 2D renderer takes over rather than leaving a frozen     */
+  /* canvas that looks like a hang.                                          */
+  /* ---------------------------------------------------------------------- */
+
+  private handleLost = (event: Event): void => {
+    // Three registers its own listener and already prevents the default. Doing
+    // it again is harmless and does not depend on listener ordering.
+    event.preventDefault();
+    this.contextLost = true;
+    this.emit({ type: 'contextLost' });
+    if (this.restoreTimer) clearTimeout(this.restoreTimer);
+    this.restoreTimer = setTimeout(() => {
+      if (this.contextLost && !this.disposed) {
+        this.emit({ type: 'fatal', reason: 'the WebGL context was lost and did not come back' });
+      }
+    }, RESTORE_GRACE_MS);
+  };
+
+  private handleRestored = (): void => {
+    this.contextLost = false;
+    if (this.restoreTimer) clearTimeout(this.restoreTimer);
+    this.restoreTimer = null;
+
+    // Three rebuilds every GPU-side cache on restore — buffers, textures,
+    // programs, render targets — and re-uploads each from the JavaScript array
+    // that owns it on the next frame. So the geometry does not need rebuilding
+    // and must not be: disposing it here would ask the new context to delete
+    // handles from the old one. What does *not* survive are the settings held
+    // on the renderer rather than in a resource, which is this much:
+    this.renderer.setPixelRatio(1);
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.setClearColor(new THREE.Color(GROUND[1]), 1);
+    this.palette.needsUpdate = true;
+    this.ringTex.needsUpdate = true;
+    this.emit({ type: 'contextRestored' });
+  };
+
+  get lost(): boolean {
+    return this.contextLost;
   }
 
   /* ---------------------------------------------------------------------- */
@@ -104,9 +174,10 @@ export class TreeRenderer {
     this.tree = tree;
     this.slots = limbSlotCount(tree);
     this.segments = segments;
-    this.leafCount = Math.min(tree.order.length, MAX_LEAVES);
+    this.morph.setStructure(tree);
+    const leafCount = this.morph.leafCount;
 
-    this.leaves = new LeafSystem(this.leafCount, this.palette, new THREE.Color(GROUND[3]));
+    this.leaves = new LeafSystem(leafCount, this.palette, new THREE.Color(GROUND[3]));
     this.limbs = new LimbSystem(this.slots, segments, this.ringTex, {
       bark: new THREE.Color(SPECIMEN[2]),
       barkLit: new THREE.Color(SPECIMEN[6]),
@@ -116,36 +187,29 @@ export class TreeRenderer {
     this.scene.add(this.limbs.mesh, this.leaves.mesh);
 
     // Delay from limb depth: the tree unfolds trunk-outward rather than at once.
-    const maxDepth = Math.max(1, tree.stats.maxDepth);
-    const leafDelay = new Float32Array(this.leafCount);
-    const leafSeed = new Float32Array(this.leafCount);
-    for (let i = 0; i < this.leafCount; i++) {
-      const node = tree.nodes.get(tree.order[i])!;
-      const depth = tree.limbs[node.limbId]?.depth ?? 0;
-      leafDelay[i] = (depth / maxDepth) * 0.34;
-      leafSeed[i] = (hashOid(node.oid) % 10007) / 10007;
-    }
-    this.leaves.write('aDelay', leafDelay);
-    this.leaves.write('aSeed', leafSeed);
+    this.leaves.write('aDelay', this.morph.leafDelay);
+    this.leaves.write('aSeed', this.morph.leafSeed);
 
     const vpl = segments * LIMB_RING_VERTS;
     const limbDelay = new Float32Array(this.slots * vpl);
     const limbGhost = new Float32Array(this.slots * vpl);
     for (let s = 0; s < this.slots; s++) {
       const limb = tree.limbs[s];
-      const depth = limb?.depth ?? 0;
       const ghost = limb && (limb.synthesized || !limb.rejoined) ? 1 : 0;
-      limbDelay.fill((depth / maxDepth) * 0.34, s * vpl, (s + 1) * vpl);
+      limbDelay.fill(this.morph.limbDelay(s), s * vpl, (s + 1) * vpl);
       limbGhost.fill(ghost, s * vpl, (s + 1) * vpl);
     }
     this.limbs.write('aDelay', limbDelay);
     this.limbs.write('aGhost', limbGhost);
 
-    this.pickPositions = new Float32Array(this.leafCount * 3);
+    this.centerScratch = new Float32Array(this.slots * segments * LIMB_RING_VERTS * 3);
+    this.heightScratch = new Float32Array(this.slots * segments * LIMB_RING_VERTS);
+    this.leafScratch = new Float32Array(leafCount);
+
     this.addGround();
     this.live = 'A';
-    this.progress = 1;
     this.transitioning = false;
+    this.setResolution(this.pixel.resolution);
   }
 
   private addGround(): void {
@@ -211,46 +275,44 @@ export class TreeRenderer {
       target,
       result.limbVertices,
       result.limbVisible,
-      ringCenters(result.limbVertices, this.slots, this.segments),
+      ringCentersInto(result.limbVertices, this.slots, this.segments, this.centerScratch),
     );
 
-    const limbHeight = new Float32Array(this.slots * this.segments * LIMB_RING_VERTS);
+    const limbHeight = this.heightScratch;
+    const span = Math.max(1e-3, result.bounds.max[1] - result.bounds.min[1]);
     for (let s = 0; s < this.slots; s++) {
       for (let j = 0; j < this.segments; j++) {
-        const y = result.limbVertices[(s * this.segments + j) * LIMB_RING_VERTS * 3 + 1];
-        const h = (y - result.bounds.min[1]) / Math.max(1e-3, result.bounds.max[1] - result.bounds.min[1]);
-        limbHeight.fill(h, (s * this.segments + j) * LIMB_RING_VERTS, (s * this.segments + j + 1) * LIMB_RING_VERTS);
+        const ring = s * this.segments + j;
+        const y = result.limbVertices[ring * LIMB_RING_VERTS * 3 + 1];
+        const h = (y - result.bounds.min[1]) / span;
+        limbHeight.fill(h, ring * LIMB_RING_VERTS, (ring + 1) * LIMB_RING_VERTS);
       }
     }
     this.limbs.write('aHeight', limbHeight);
     this.updateRings(result.rings);
 
-    this.previous = this.current;
-    this.current = result;
+    this.morph.push(result);
 
-    const toB = target === 'B' ? 1 : 0;
-    this.setUniform('uToB', toB);
+    this.setUniform('uToB', target === 'B' ? 1 : 0);
     this.transitionDuration = Math.max(1, opts.duration ?? (this.reduceMotion ? 180 : 900));
     this.transitionStart = performance.now();
-    this.progress = 0;
     this.transitioning = true;
     this.onTransitionDone = opts.onDone ?? null;
     this.live = target;
-    this.pickDirty = true;
   }
 
   /** Snap straight to a layout with no animation. Used on first paint. */
   setLayoutImmediate(result: LayoutResult): void {
     this.applyLayout(result, { duration: 1 });
-    this.progress = 1;
+    this.morph.setProgress(1);
     this.transitioning = false;
     this.setUniform('uProgress', 1);
-    this.pickDirty = true;
   }
 
   private updateRings(rings: RingMark[]): void {
-    const w = 512;
-    const data = new Uint8Array(w * 4);
+    const w = RING_TEXELS;
+    const data = this.ringData;
+    data.fill(0);
     for (const r of rings) {
       const x = Math.round(Math.min(1, Math.max(0, r.t)) * (w - 1));
       const weight = r.major ? 255 : 96;
@@ -261,14 +323,13 @@ export class TreeRenderer {
         if (v > data[i * 4]) data[i * 4] = v;
       }
     }
-    this.ringTex.image.data = data;
     this.ringTex.needsUpdate = true;
   }
 
   setLens(attrs: LensAttributes): void {
     if (!this.leaves) return;
-    const n = this.leafCount;
-    const family = new Float32Array(n);
+    const n = this.morph.leafCount;
+    const family = this.leafScratch;
     for (let i = 0; i < n; i++) family[i] = attrs.family[i] ?? 1;
     this.leaves.write('aFamily', family);
     this.leaves.write('aTone', attrs.tone);
@@ -278,8 +339,8 @@ export class TreeRenderer {
   /** Start the fall for the commits the deletions lens marked net-negative. */
   setFalling(falling: Float32Array, now: number): void {
     if (!this.leaves) return;
-    const n = this.leafCount;
-    const starts = new Float32Array(n);
+    const n = this.morph.leafCount;
+    const starts = this.leafScratch;
     for (let i = 0; i < n; i++) {
       // Stagger, so a thousand leaves do not release on the same frame.
       starts[i] = falling[i] > 0 ? now + ((i * 37) % 900) / 300 : 0;
@@ -289,15 +350,19 @@ export class TreeRenderer {
 
   clearFalling(): void {
     if (!this.leaves) return;
-    this.leaves.write('aFallStart', new Float32Array(this.leafCount));
+    this.leafScratch.fill(0);
+    this.leaves.write('aFallStart', this.leafScratch);
   }
 
   /** Dim non-matching commits for search. Writes one attribute; moves nothing. */
   setDim(match: Set<string> | null): void {
     if (!this.leaves || !this.tree) return;
-    const dim = new Float32Array(this.leafCount);
+    // Search runs this on every keystroke, so it stages through the shared
+    // scratch rather than allocating a fresh array per character typed.
+    const n = this.morph.leafCount;
+    const dim = this.leafScratch;
     if (!match) dim.fill(1);
-    else for (let i = 0; i < this.leafCount; i++) dim[i] = match.has(this.tree.order[i]) ? 1 : 0.12;
+    else for (let i = 0; i < n; i++) dim[i] = match.has(this.tree.order[i]) ? 1 : 0.12;
     this.leaves.write('aDim', dim);
   }
 
@@ -345,70 +410,12 @@ export class TreeRenderer {
   /* Picking                                                                */
   /* ---------------------------------------------------------------------- */
 
-  private refreshPickPositions(): void {
-    if (!this.current || !this.tree) return;
-    const a = this.previous ?? this.current;
-    const b = this.current;
-    const n = this.leafCount;
-    const p = this.progress;
-    const maxDepth = Math.max(1, this.tree.stats.maxDepth);
-    for (let i = 0; i < n; i++) {
-      const node = this.tree.nodes.get(this.tree.order[i])!;
-      const depth = this.tree.limbs[node.limbId]?.depth ?? 0;
-      const delay = (depth / maxDepth) * 0.34;
-      const s = smoothstep(delay, delay + 0.6, p);
-      for (let k = 0; k < 3; k++) {
-        const av = a.leafPositions[i * 3 + k];
-        const bv = b.leafPositions[i * 3 + k];
-        this.pickPositions[i * 3 + k] = av + (bv - av) * s;
-      }
-    }
-    this.pickDirty = false;
-  }
-
-  /**
-   * Raycast against the leaves analytically. Three's instanced raycasting reads
-   * an instance matrix we deliberately never write, and 20,000 point-to-ray
-   * distances are cheaper than the matrices would have been anyway.
-   */
   pick(ndcX: number, ndcY: number, growth: number): number {
-    if (!this.current || !this.tree) return -1;
-    if (this.pickDirty) this.refreshPickPositions();
-
-    const ray = new THREE.Raycaster();
-    ray.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.cam.camera);
-    const origin = ray.ray.origin;
-    const dir = ray.ray.direction;
-
-    let bestIdx = -1;
-    let bestT = Infinity;
-    const p = new THREE.Vector3();
-    for (let i = 0; i < this.leafCount; i++) {
-      const size = this.current.leafSizes[i];
-      if (size <= 0) continue;
-      if (this.current.leafHeights[i] > growth) continue;
-      p.set(this.pickPositions[i * 3], this.pickPositions[i * 3 + 1], this.pickPositions[i * 3 + 2]);
-      p.sub(origin);
-      const t = p.dot(dir);
-      if (t <= 0 || t >= bestT) continue;
-      const perp = p.addScaledVector(dir, -t).lengthSq();
-      const r = size * 1.5;
-      if (perp <= r * r) {
-        bestT = t;
-        bestIdx = i;
-      }
-    }
-    return bestIdx;
+    return this.morph.pick(this.cam, ndcX, ndcY, growth);
   }
 
   worldPositionOf(index: number): THREE.Vector3 | null {
-    if (!this.current || index < 0 || index >= this.leafCount) return null;
-    if (this.pickDirty) this.refreshPickPositions();
-    return new THREE.Vector3(
-      this.pickPositions[index * 3],
-      this.pickPositions[index * 3 + 1],
-      this.pickPositions[index * 3 + 2],
-    );
+    return this.morph.worldPositionOf(index);
   }
 
   /* ---------------------------------------------------------------------- */
@@ -421,14 +428,12 @@ export class TreeRenderer {
     this.cam.camera.aspect = aspect;
     this.cam.camera.updateProjectionMatrix();
     this.pixel.resize(aspect);
-    const res = this.pixel.resolution;
-    this.setResolution(res);
+    this.setResolution(this.pixel.resolution);
   }
 
   /** Raise the render resolution while flying, so a zoom resolves detail. */
   setRenderScale(scale: number): void {
-    const aspect = this.cam.camera.aspect;
-    this.pixel.resize(aspect, scale);
+    this.pixel.resize(this.cam.camera.aspect, scale);
     this.setResolution(this.pixel.resolution);
   }
 
@@ -439,31 +444,45 @@ export class TreeRenderer {
       const m = this.ground.material as THREE.ShaderMaterial;
       (m.uniforms.uResolution.value as THREE.Vector2).copy(res);
     }
-    // Leaf size is quantized to whole low-resolution pixels; the unit follows
-    // the target size so leaves stay the same physical size on screen.
     if (this.leaves) {
-      this.leaves.material.uniforms.uPixelUnit.value = Math.max(0.08, 168 / res.y);
+      (this.leaves.material.uniforms.uLeafRange.value as THREE.Vector3).set(LEAF_MIN_PX, LEAF_MAX_PX, LEAF_HEADROOM);
+      this.updatePixelScale();
     }
   }
 
+  /**
+   * World units per render-target pixel, at one unit of depth. The leaf shader
+   * multiplies this by a leaf's own depth to size it in whole screen pixels
+   * rather than whole world units. It has to be refreshed every frame because
+   * the field of view is what the unfold animates.
+   */
+  private updatePixelScale(): void {
+    if (!this.leaves) return;
+    const fov = (this.cam.camera.fov * Math.PI) / 180;
+    const h = Math.max(1, this.pixel.resolution.y);
+    this.leaves.material.uniforms.uPixelScale.value = (2 * Math.tan(fov / 2)) / h;
+  }
+
   render(now: number): void {
-    const dt = Math.min(0.05, this.clock.getDelta());
+    if (this.contextLost) return;
+    const dt = this.lastFrame ? Math.min(0.05, (now - this.lastFrame) / 1000) : 0.016;
+    this.lastFrame = now;
     const t = now / 1000;
 
     if (this.transitioning) {
       const p = Math.min(1, (now - this.transitionStart) / this.transitionDuration);
-      this.progress = p;
-      this.pickDirty = true;
+      this.morph.setProgress(p);
       if (p >= 1) {
         this.transitioning = false;
         this.onTransitionDone?.();
         this.onTransitionDone = null;
       }
     }
-    this.setUniform('uProgress', this.progress);
+    this.setUniform('uProgress', this.morph.progress);
     this.setUniform('uTime', t);
 
     this.cam.update(dt, now);
+    this.updatePixelScale();
 
     // Haze has to be measured against how far away the camera actually is. The
     // flat state pulls back to a few hundred units to fake an orthographic
@@ -506,6 +525,12 @@ export class TreeRenderer {
   }
 
   dispose(): void {
+    this.disposed = true;
+    if (this.restoreTimer) clearTimeout(this.restoreTimer);
+    const canvas = this.canvas;
+    canvas.removeEventListener('webglcontextlost', this.handleLost);
+    canvas.removeEventListener('webglcontextrestored', this.handleRestored);
+    this.handlers.clear();
     this.disposeSystems();
     if (this.ground) {
       this.scene.remove(this.ground);
@@ -517,27 +542,42 @@ export class TreeRenderer {
     this.palette.dispose();
     this.ringTex.dispose();
     this.renderer.dispose();
+    // Deliberately *not* forceContextLoss(). The canvas element outlives this
+    // object — React remounts it in development, and a repository change keeps
+    // it — and a canvas whose context has been force-lost will never grant
+    // another one of any kind, which turns a remount into a blank page. The
+    // context goes when the element does, and the element is only ever
+    // discarded when we are swapping renderers, which replaces it outright.
   }
 }
 
-function smoothstep(e0: number, e1: number, x: number): number {
-  const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0 || 1e-6)));
-  return t * t * (3 - 2 * t);
-}
-
-function hashOid(oid: string): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < oid.length; i++) {
-    h ^= oid.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
+/**
+ * Ask for a context, and keep asking with less. `high-performance` is a hint
+ * some drivers treat as a requirement — a machine with a discrete GPU asleep
+ * can refuse it and then happily grant the default. Failing over costs one
+ * synchronous call and is the difference between the tree drawing and not.
+ */
+function createGLRenderer(canvas: HTMLCanvasElement): THREE.WebGLRenderer {
+  const attempts: THREE.WebGLRendererParameters[] = [
+    { canvas, antialias: false, alpha: false, powerPreference: 'high-performance' },
+    { canvas, antialias: false, alpha: false, powerPreference: 'default' },
+    { canvas },
+  ];
+  let last: unknown;
+  for (const params of attempts) {
+    try {
+      return new THREE.WebGLRenderer(params);
+    } catch (e) {
+      last = e;
+    }
   }
-  return h >>> 0;
+  throw last instanceof Error ? last : new Error('WebGL context creation failed');
 }
 
 /** Three rows of eight: decay, specimen, categorical. Sampled by family and tone. */
 function makePaletteTexture(): THREE.DataTexture {
   const w = 8;
-  const h = 3;
+  const h = LENS_ROWS.length;
   const data = new Uint8Array(w * h * 4);
   LENS_ROWS.forEach((row, y) => {
     row.forEach((hex, x) => {
@@ -558,19 +598,11 @@ function makePaletteTexture(): THREE.DataTexture {
   return tex;
 }
 
-function makeRingTexture(rings: RingMark[]): THREE.DataTexture {
-  const w = 512;
-  const data = new Uint8Array(w * 4);
-  for (const r of rings) {
-    const x = Math.round(Math.min(1, Math.max(0, r.t)) * (w - 1));
-    data[x * 4] = r.major ? 255 : 96;
-  }
-  const tex = new THREE.DataTexture(data, w, 1, THREE.RGBAFormat);
+function makeRingTexture(data: Uint8Array): THREE.DataTexture {
+  const tex = new THREE.DataTexture(data, RING_TEXELS, 1, THREE.RGBAFormat);
   tex.magFilter = THREE.LinearFilter;
   tex.minFilter = THREE.LinearFilter;
   tex.generateMipmaps = false;
   tex.needsUpdate = true;
   return tex;
 }
-
-export { PALETTE };
