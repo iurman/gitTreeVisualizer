@@ -9,7 +9,13 @@ import type { Commit, Ref, RepoSnapshot } from '@gittree/core';
 /* exists. v2's local CLI is a sibling of this module, not a change to it.     */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * GitHub caps `first` on any connection at 100. Asking for more does not error
+ * the request outright: it nulls the offending field and reports the problem in
+ * `errors`, which reads downstream as a repository with no history at all.
+ */
 export const PAGE_SIZE = 100;
+/** How many commits the first response carries, gathered over several queries. */
 export const FIRST_PAGE_COMMITS = 300;
 export const MAX_COMMITS = 2000;
 
@@ -92,6 +98,35 @@ export type FetchResult = {
   headSha: string;
 };
 
+async function runQuery(
+  owner: string,
+  name: string,
+  cursor: string | null,
+  token: string,
+): Promise<GqlResponse> {
+  const res = await fetch('https://api.github.com/graphql', {
+    method: 'POST',
+    headers: {
+      authorization: `bearer ${token}`,
+      'content-type': 'application/json',
+      'user-agent': 'tree.isaacurman.com',
+    },
+    body: JSON.stringify({ query: QUERY, variables: { owner, name, cursor, page: PAGE_SIZE } }),
+  });
+
+  if (res.status === 401 || res.status === 403) {
+    throw new AdapterError(
+      503,
+      'GitHub turned the request away.',
+      'This usually means the token is wrong or the API budget is spent.',
+    );
+  }
+  if (!res.ok) {
+    throw new AdapterError(502, 'GitHub did not answer.', `It replied ${res.status}.`);
+  }
+  return (await res.json()) as GqlResponse;
+}
+
 export async function fetchSnapshot(
   owner: string,
   name: string,
@@ -102,54 +137,66 @@ export async function fetchSnapshot(
     throw new AdapterError(500, 'The server is missing its GitHub credentials.', 'Set GITHUB_TOKEN and redeploy.');
   }
 
-  // The first page is deliberately smaller so the seed state is ready fast; the
-  // rest streams in while the reader takes in the landing copy.
-  const page = cursor ? PAGE_SIZE : Math.min(FIRST_PAGE_COMMITS, MAX_COMMITS);
+  // The first response carries enough commits for the seed state to be ready
+  // immediately. Since one query can only return a hundred, that is three
+  // queries, and every later request is a single one.
+  const want = cursor ? PAGE_SIZE : FIRST_PAGE_COMMITS;
 
-  const res = await fetch('https://api.github.com/graphql', {
-    method: 'POST',
-    headers: {
-      authorization: `bearer ${token}`,
-      'content-type': 'application/json',
-      'user-agent': 'tree.isaacurman.com',
-    },
-    body: JSON.stringify({ query: QUERY, variables: { owner, name, cursor, page } }),
-  });
+  const commits: Commit[] = [];
+  let at: string | null = cursor;
+  let first: NonNullable<GqlResponse['data']>['repository'] = null;
+  let totalCount = 0;
+  let hasNextPage = false;
 
-  if (res.status === 401 || res.status === 403) {
-    throw new AdapterError(503, 'GitHub turned the request away.', 'This usually means the API budget is spent. Try again shortly.');
-  }
-  if (!res.ok) {
-    throw new AdapterError(502, 'GitHub did not answer.', `It replied ${res.status}.`);
+  while (commits.length < want) {
+    const body: GqlResponse = await runQuery(owner, name, at, token);
+    const repo = body.data?.repository;
+    const history = repo?.defaultBranchRef?.target?.history;
+
+    if (!repo || !history) {
+      // Distinguish the three ways this can go wrong. Reporting a GraphQL
+      // failure as "no commits yet" sent a real repository's real error into a
+      // dead end once already.
+      if (body.errors?.some((e) => e.type === 'NOT_FOUND') || !repo) {
+        throw new AdapterError(404, 'Repository not found, or it is private. Only public repositories are supported.');
+      }
+      if (body.errors?.length) {
+        throw new AdapterError(502, 'GitHub could not read that history.', body.errors[0].message);
+      }
+      if (!repo.defaultBranchRef) {
+        throw new AdapterError(
+          422,
+          'That repository has no commits yet.',
+          'There is nothing to grow from an empty history.',
+        );
+      }
+      throw new AdapterError(502, 'GitHub returned a history this could not read.');
+    }
+
+    if (!first) {
+      first = repo;
+      if ((repo.diskUsage ?? 0) > MAX_DISK_USAGE_KB) {
+        throw new AdapterError(
+          413,
+          'That repository is too large to read here.',
+          'Repositories over about twenty gigabytes are refused rather than timing out.',
+        );
+      }
+    }
+
+    totalCount = history.totalCount;
+    commits.push(...history.nodes.map(toCommit));
+    hasNextPage = history.pageInfo.hasNextPage;
+    at = history.pageInfo.endCursor;
+    if (!hasNextPage || !at) break;
+    if (commits.length >= MAX_COMMITS) break;
   }
 
-  const body = (await res.json()) as GqlResponse;
-  const notFound = body.errors?.some((e) => e.type === 'NOT_FOUND');
-  const repo = body.data?.repository;
-  if (notFound || !repo) {
-    throw new AdapterError(404, 'Repository not found, or it is private. Only public repositories are supported.');
-  }
-  if ((repo.diskUsage ?? 0) > MAX_DISK_USAGE_KB) {
-    throw new AdapterError(
-      413,
-      'That repository is too large to read here.',
-      'Repositories over about twenty gigabytes are refused rather than timing out.',
-    );
-  }
-
-  const branch = repo.defaultBranchRef;
-  const history = branch?.target?.history;
-  if (!branch || !history) {
-    throw new AdapterError(422, 'That repository has no commits yet.', 'There is nothing to grow from an empty history.');
-  }
-
-  const commits: Commit[] = history.nodes.map(toCommit);
+  const repo = first!;
+  const branch = repo.defaultBranchRef!;
   const refs: Ref[] = (repo.refs?.nodes ?? [])
     .filter((r): r is { name: string; target: { oid: string } } => !!r.target)
     .map((r) => ({ name: r.name, oid: r.target.oid, kind: 'branch' as const }));
-
-  const truncated = history.totalCount > MAX_COMMITS;
-  const nextCursor = history.pageInfo.hasNextPage ? history.pageInfo.endCursor : null;
 
   const snapshot: RepoSnapshot = {
     schemaVersion: 1,
@@ -158,13 +205,13 @@ export async function fetchSnapshot(
     head: branch.target?.oid ?? commits[0]?.oid ?? '',
     defaultBranch: branch.name,
     source: 'github',
-    truncated,
+    truncated: totalCount > MAX_COMMITS,
     generatedAt: new Date().toISOString(),
     commits,
     refs,
   };
 
-  return { snapshot, cursor: nextCursor, headSha: snapshot.head };
+  return { snapshot, cursor: hasNextPage ? at : null, headSha: snapshot.head };
 }
 
 function toCommit(n: GqlCommit): Commit {

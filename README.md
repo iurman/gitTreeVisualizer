@@ -135,7 +135,7 @@ shell is usually scoped to something else, and this stops it being spent by
 accident.
 
 ```bash
-pnpm test         # the core test suite
+pnpm test         # core and adapter test suites
 pnpm typecheck    # every package
 pnpm build        # production build
 ```
