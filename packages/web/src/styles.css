@@ -1041,9 +1041,36 @@ button {
     flex-direction: row;
   }
 
+  /* On a narrow viewport the rails run horizontally, so the mode control has to
+     stay on one line and scroll rather than wrapping into a tall column. */
+  .modebar .segmented {
+    flex-wrap: nowrap;
+  }
+
+  .modebar .segmented button,
+  .lensbar .segmented button {
+    border-bottom: none;
+    border-right: 1px solid var(--g3);
+  }
+
   .lensbar .caption,
   .modebar .caption {
     display: none;
+  }
+
+  /* The track is the point of the rule; the read-out is repeated in the
+     range hint below it, so it gives up its space first. */
+  .rule-readout {
+    display: none;
+  }
+
+  .ring-control {
+    flex-shrink: 0;
+  }
+
+  .rule-hint {
+    gap: 8px;
+    font-size: 10.5px;
   }
 
   .detail {

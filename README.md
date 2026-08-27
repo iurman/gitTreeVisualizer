@@ -114,7 +114,15 @@ pnpm dev          # http://localhost:5173
 
 With no credentials, the development server serves a synthesized repository
 with real branch topology, dormant gaps and bursts. It is deterministic, so a
-visual change is always a change you made.
+visual change is always a change you made. The repository name picks the shape,
+so every case is a deep link:
+
+| Path | What you get |
+|---|---|
+| `/acme/demo` | Merge topology, sub-branches, a few abandoned refs |
+| `/acme/demo-5000` | The same, at five thousand commits |
+| `/acme/squash-300` | A squash-merged history; branches reconstructed from pull requests |
+| `/acme/flat-300` | No recoverable structure at all; directory mode takes over |
 
 To develop against real repositories:
 

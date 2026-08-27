@@ -111,12 +111,107 @@ function synthesize(name: string, commitCount = 1400): RepoSnapshot {
   };
 }
 
+/** A squash-merged history: linear, no merge commits. With PR data, branches
+ * can be reconstructed; without it, directory mode takes over. */
+function linear(name: string, commitCount: number, withPrData: boolean): RepoSnapshot {
+  const authors = ['Ada Lovelace', 'Grace Hopper', 'Alan Turing'];
+  const words = ['parser', 'cache', 'router', 'store', 'shader', 'index'];
+  let seed = 0x51a7c3;
+  const rnd = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  let clock = Date.UTC(2019, 5, 1);
+  const commits: Commit[] = [];
+  for (let i = 0; i < commitCount; i++) {
+    clock += 3_600_000 * (1 + rnd() * 40);
+    const oid = `${(i + 0x20000).toString(16)}${'0'.repeat(33)}`.slice(0, 40);
+    commits.push({
+      oid,
+      parents: i === 0 ? [] : [commits[i - 1].oid],
+      author: authors[Math.floor(rnd() * authors.length)],
+      authorEmail: 'dev@example.com',
+      date: new Date(clock).toISOString(),
+      subject: `Rework the ${words[Math.floor(rnd() * words.length)]} (#${400 + i})`,
+      additions: Math.floor(5 + rnd() * 600),
+      deletions: Math.floor(rnd() * 260),
+      filesChanged: Math.max(1, Math.floor(rnd() * 9)),
+      ...(withPrData ? { prNumber: 400 + i, prCommitCount: 2 + Math.floor(rnd() * 7) } : {}),
+    });
+  }
+  const snapshot: RepoSnapshot = {
+    schemaVersion: 1,
+    name,
+    description: withPrData ? 'A squash-merged history.' : 'A history with no recoverable structure.',
+    head: commits[commits.length - 1].oid,
+    defaultBranch: 'main',
+    source: 'github',
+    truncated: false,
+    generatedAt: new Date().toISOString(),
+    commits: commits.reverse(),
+    refs: [{ name: 'main', oid: commits[0].oid, kind: 'branch' }],
+  };
+  if (!withPrData) {
+    const dirs = ['src', 'src/core', 'src/ui', 'src/ui/panels', 'packages/api', 'packages/api/routes', 'docs', 'test'];
+    snapshot.tree = Array.from({ length: 240 }, (_, i) => ({
+      path: `${dirs[i % dirs.length]}/mod${i % 17}/file${i}.${['ts', 'tsx', 'css', 'md'][i % 4]}`,
+      size: 200 + i * 7,
+    }));
+  }
+  return snapshot;
+}
+
+/**
+ * The shape comes from the repository name, not a query parameter: the viewer
+ * builds its own API URLs, so a name is the only thing that survives a deep
+ * link. `acme/squash-300` gives a squash-merged history of 300 commits,
+ * `acme/flat` one with no recoverable structure at all, and any trailing number
+ * sets the size.
+ */
+function shapeFor(owner: string, name: string, url: URL): RepoSnapshot {
+  const size = Number(/-(\d+)$/.exec(name)?.[1] ?? url.searchParams.get('n') ?? 1400);
+  if (/^squash/.test(name)) return linear(`${owner}/${name}`, size, true);
+  if (/^flat/.test(name)) return linear(`${owner}/${name}`, size, false);
+  return synthesize(`${owner}/${name}`, size);
+}
+
 export function devApi(): Plugin {
   return {
     name: 'gittree-dev-api',
     configureServer(server) {
       server.middlewares.use(async (req, res, next) => {
         const url = new URL(req.url ?? '/', 'http://localhost');
+
+        // The flat drawing, so the no-WebGL fallback can be exercised locally.
+        const svgMatch = /^\/api\/silhouette\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+        if (svgMatch) {
+          // Loaded through Vite so core's TypeScript sources resolve; importing
+          // it at config-load time would be evaluated by bare Node instead.
+          const core = await server.ssrLoadModule('@gittree/core');
+          const snapshot = shapeFor(decodeURIComponent(svgMatch[1]), decodeURIComponent(svgMatch[2]), url);
+          let tree = core.buildTopology(snapshot);
+          if (tree.stats.flat && snapshot.tree?.length) tree = core.buildDirectoryTopology(snapshot);
+          const opts = core.defaultLayoutOptions(tree);
+          const window = url.searchParams.get('from') && url.searchParams.get('to')
+            ? { start: url.searchParams.get('from')!, end: url.searchParams.get('to')! }
+            : opts.window;
+          const result = core.layout(tree, 'tree2d', {
+            ...opts,
+            window,
+            ringUnit: core.autoRingUnit(window),
+            growthCutoff: 1,
+          });
+          res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+          res.end(
+            core.silhouetteSvg(tree, result, {
+              width: Number(url.searchParams.get('w') ?? 1200),
+              height: Number(url.searchParams.get('h') ?? 700),
+              caption: url.searchParams.get('caption') !== '0',
+            }),
+          );
+          return;
+        }
+
         const repoMatch = /^\/api\/repo\/([^/]+)\/([^/]+)$/.exec(url.pathname);
         if (!repoMatch) return next();
 
@@ -142,8 +237,7 @@ export function devApi(): Plugin {
           return;
         }
 
-        const size = Number(url.searchParams.get('n') ?? 1400);
-        res.end(JSON.stringify({ snapshot: synthesize(`${owner}/${name}`, size), cursor: null }));
+        res.end(JSON.stringify({ snapshot: shapeFor(owner, name, url), cursor: null }));
       });
     },
   };

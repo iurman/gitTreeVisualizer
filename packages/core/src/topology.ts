@@ -350,10 +350,12 @@ function finish(
     .filter((n) => n.commit.parents.filter((p) => nodes.has(p)).length === 0 && !n.synthetic)
     .map((n) => n.oid);
 
+  // Reconstructed commits count toward the range even though they are
+  // inventions: they are laid out and drawn, so leaving them outside the window
+  // would report them as a pre-window stump on a repository nobody has windowed.
   let min = Infinity;
   let max = -Infinity;
   for (const n of nodes.values()) {
-    if (n.synthetic) continue;
     if (n.time < min) min = n.time;
     if (n.time > max) max = n.time;
   }

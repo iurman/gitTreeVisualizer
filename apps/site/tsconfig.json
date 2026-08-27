@@ -1,10 +1,32 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "jsx": "react-jsx",
     "noEmit": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ],
+    "paths": {
+      "@gittree/core": [
+        "../../packages/core/src/index.ts"
+      ],
+      "@gittree/web": [
+        "../../packages/web/src/index.ts"
+      ],
+      "@gittree/web/styles.css": [
+        "../../packages/web/src/styles.css"
+      ]
+    }
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "api/**/*.ts", "vite.config.ts"]
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "api/**/*.ts",
+    "vite.config.ts"
+  ]
 }

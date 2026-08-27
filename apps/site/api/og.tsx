@@ -33,7 +33,8 @@ export default async function handler(req: Request): Promise<Response> {
 
   let art: string | null = null;
   let title = 'Every repository is a tree';
-  let subtitle = 'tree.isaacurman.com';
+  let subtitle = 'Git history, grown from a seed';
+  let detail = 'tree.isaacurman.com';
 
   const parts = repo?.split('/') ?? [];
   if (parts.length === 2) {
@@ -55,14 +56,19 @@ export default async function handler(req: Request): Promise<Response> {
         growthCutoff: 1,
       });
 
-      art = silhouetteSvg(tree, result, { width: 1200, height: 470, caption: false });
+      // The tree is portrait and the card is landscape, so the drawing takes
+      // the right half at full height and the label sits beside it, the way a
+      // specimen plate carries its own label.
+      art = silhouetteSvg(tree, result, { width: 660, height: 630, caption: false });
       title = snapshot.name;
       const windowNote =
-        from && to ? `${from.slice(0, 10)} → ${to.slice(0, 10)}` : `${tree.stats.limbCount.toLocaleString('en-US')} limbs`;
-      subtitle = `${tree.stats.commitCount.toLocaleString('en-US')} commits · ${windowNote} · ${tree.stats.authors.length} contributors`;
+        from && to ? `${from.slice(0, 10)} → ${to.slice(0, 10)}` : 'full history';
+      subtitle = `${tree.stats.commitCount.toLocaleString('en-US')} commits`;
+      detail = `${tree.stats.limbCount.toLocaleString('en-US')} limbs · ${tree.stats.authors.length} contributors · ${windowNote}`;
     } catch {
       title = repo ?? title;
       subtitle = 'Repository not found, or it is private.';
+      detail = 'Only public repositories are supported.';
     }
   }
 
@@ -73,32 +79,36 @@ export default async function handler(req: Request): Promise<Response> {
           width: '100%',
           height: '100%',
           display: 'flex',
-          flexDirection: 'column',
+          flexDirection: 'row',
           background: GROUND,
-          padding: 0,
         }}
       >
-        {art ? (
-          <img
-            width={1200}
-            height={470}
-            src={`data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(art)))}`}
-            style={{ width: 1200, height: 470 }}
-          />
-        ) : (
-          <div style={{ display: 'flex', width: 1200, height: 470 }} />
-        )}
         <div
           style={{
             display: 'flex',
             flexDirection: 'column',
-            padding: '24px 56px',
-            borderTop: `1px solid ${ACCENT}`,
+            justifyContent: 'center',
+            width: 540,
+            height: 630,
+            padding: '0 56px',
           }}
         >
-          <div style={{ fontSize: 54, color: INK, letterSpacing: '-0.02em' }}>{title}</div>
-          <div style={{ fontSize: 24, color: MUTED, marginTop: 8 }}>{subtitle}</div>
+          <div style={{ fontSize: 20, color: ACCENT, letterSpacing: '0.18em' }}>SPECIMEN</div>
+          <div style={{ fontSize: 56, color: INK, marginTop: 14, lineHeight: 1.1 }}>{title}</div>
+          <div style={{ fontSize: 30, color: MUTED, marginTop: 16 }}>{subtitle}</div>
+          <div style={{ fontSize: 22, color: MUTED, marginTop: 8 }}>{detail}</div>
+          <div style={{ fontSize: 22, color: ACCENT, marginTop: 34 }}>tree.isaacurman.com</div>
         </div>
+        {art ? (
+          <img
+            width={660}
+            height={630}
+            src={`data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(art)))}`}
+            style={{ width: 660, height: 630 }}
+          />
+        ) : (
+          <div style={{ display: 'flex', width: 660, height: 630 }} />
+        )}
       </div>
     ),
     {

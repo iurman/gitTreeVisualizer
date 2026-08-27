@@ -73,7 +73,11 @@ export function buildDirectoryTopology(snapshot: RepoSnapshot): TreeStructure {
       attachPoint: null,
       depth: d.depth,
       rejoined: true,
-      synthesized: true,
+      // Directories are recorded, not inferred. What is inferred here is which
+      // directory a commit belongs to, and the interface says so with a badge.
+      // The ghosted, dashed treatment is reserved for structure that was
+      // genuinely reconstructed, so it must not be used on real directories.
+      synthesized: false,
       label: d.path === '' ? snapshot.name.split('/')[1] || 'root' : d.path,
       seed: hash32(d.path || 'root'),
     });

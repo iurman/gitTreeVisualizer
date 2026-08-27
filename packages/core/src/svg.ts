@@ -70,8 +70,16 @@ export function silhouetteSvg(
   const parts: string[] = [];
 
   parts.push(`<rect width="${W}" height="${H}" fill="${c.background}"/>`);
+  // A ground line rather than a filled band: at most aspect ratios the band is
+  // a few pixels tall and reads as a stray bar rather than as ground.
+  const groundY = py(0);
+  if (groundY < H - 2) {
+    parts.push(
+      `<rect x="0" y="${groundY.toFixed(1)}" width="${W}" height="${(H - groundY).toFixed(1)}" fill="${c.ground}" opacity="0.55"/>`,
+    );
+  }
   parts.push(
-    `<rect x="0" y="${py(0).toFixed(1)}" width="${W}" height="${Math.max(0, H - py(0)).toFixed(1)}" fill="${c.ground}"/>`,
+    `<line x1="0" y1="${groundY.toFixed(1)}" x2="${W}" y2="${groundY.toFixed(1)}" stroke="${c.ground}" stroke-width="2"/>`,
   );
 
   // Limbs: a tapered ribbon per limb, drawn from the ring centres and radii.
@@ -122,7 +130,10 @@ export function silhouetteSvg(
     const x = px(result.leafPositions[i * 3]);
     const y = py(result.leafPositions[i * 3 + 1]);
     const node = tree.nodes.get(tree.order[i]);
-    const r = Math.max(1, sz * scale * 0.7);
+    // Smaller than the canvas draws them. Flattened to two dimensions the
+    // depth separation is gone, and at trunk densities full-size leaves fuse
+    // into a solid bar that says nothing. Undersized, they read as texture.
+    const r = Math.max(0.9, sz * scale * 0.42);
     const fill = node?.isMerge ? c.leafAlt : c.leaf;
     parts.push(`<rect x="${(x - r).toFixed(1)}" y="${(y - r).toFixed(1)}" width="${(r * 2).toFixed(1)}" height="${(r * 2).toFixed(1)}" fill="${fill}"/>`);
   }
