@@ -21,6 +21,11 @@ const ROOT = 146.83; // D3
 
 const MAX_VOICES = 8;
 const MAX_TRIGGERS_PER_SECOND = 12;
+/**
+ * The ambient bed is a bed. It has to stay under the ticks rather than become
+ * the whole soundtrack, which is what it was at three times this level.
+ */
+const AMBIENT_GAIN = 0.016;
 
 export type VoiceKind =
   | 'leaf'
@@ -385,13 +390,21 @@ export class SoundEngine {
     gain.gain.value = 0.0;
     osc.connect(filter).connect(gain).connect(this.bus);
     osc.start();
-    gain.gain.setTargetAtTime(0.05, ctx.currentTime, 2);
+    gain.gain.setTargetAtTime(AMBIENT_GAIN, ctx.currentTime, 2);
     this.ambient = { osc, filter, gain };
   }
+
+  private lastHeight = -1;
 
   /** Filter cutoff tracks camera height, so orbiting has a sense of space. */
   setCameraHeight(h: number): void {
     if (!this.ambient || !this.ctx) return;
+    // Called every frame. A non-finite height would put NaN into a biquad,
+    // which does not fail quietly, and scheduling sixty automation events a
+    // second to describe a value that has not moved is pure waste.
+    if (!Number.isFinite(h)) return;
+    if (Math.abs(h - this.lastHeight) < 0.01) return;
+    this.lastHeight = h;
     this.ambient.filter.frequency.setTargetAtTime(140 + h * 620, this.ctx.currentTime, 0.3);
   }
 
@@ -428,10 +441,17 @@ export class GrowthSonifier {
     this.denseRings = denseRings;
   }
 
+  /**
+   * Seek the cursor without firing anything. Events strictly below `to` are
+   * treated as already played; one sitting exactly on it is not, so seeking to
+   * the start leaves the whole score pending. Skipping `<= to` here silently
+   * ate the repository's first commit, which is the one event in the sequence
+   * a viewer is most likely to be waiting for.
+   */
   reset(to = 0): void {
     this.cursor = to;
     this.index = 0;
-    while (this.index < this.events.length && this.events[this.index].h <= to) this.index++;
+    while (this.index < this.events.length && this.events[this.index].h < to) this.index++;
   }
 
   /** Fire everything the growth cursor has passed since the last frame. */

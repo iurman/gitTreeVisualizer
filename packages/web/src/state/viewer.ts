@@ -337,12 +337,11 @@ export class Viewer {
     await this.layoutClient.setSnapshot(snapshot, directory);
     this.renderer?.setStructure(tree, this.opts.limbSegments);
 
-    // Load the sonification score from the same normalized-time cursor the
-    // shader gates leaves against, so sound and picture cannot drift.
-    this.loadScore(tree);
-
     const result = await this.layoutClient.layout(this.state.mode, this.opts);
     this.current = result;
+    // Scored from the same normalized-time cursor the shader gates leaves
+    // against, so sound and picture cannot drift.
+    this.loadScore(tree, result);
     this.renderer?.setLayoutImmediate(result);
     this.renderer?.setGrowth(this.opts.growthCutoff);
     this.applyBounds(result);
@@ -357,7 +356,14 @@ export class Viewer {
     if (url.at && tree.nodes.has(url.at)) this.set({ selected: url.at });
   }
 
-  private loadScore(tree: TreeStructure): void {
+  /**
+   * Build the sonification score against a layout, so every event carries the
+   * same normalized height the vertex shader gates its leaf against. It has to
+   * take the result rather than read `this.current`, which is not assigned
+   * until after the first layout resolves — reading it early gave every event a
+   * height of zero, and seeking to the start then skipped the entire score.
+   */
+  private loadScore(tree: TreeStructure, result: LayoutResult): void {
     const events: { h: number; ev: GrowthEvent }[] = [];
     const churnMax = Math.max(
       1,
@@ -366,13 +372,10 @@ export class Viewer {
         return c.additions + c.deletions;
       }),
     );
-    const scaleFor = this.opts;
-    if (!scaleFor) return;
-
-    const heights = this.current?.leafHeights;
+    const heights = result.leafHeights;
     tree.order.forEach((oid, i) => {
       const node = tree.nodes.get(oid)!;
-      const h = heights?.[i] ?? 0;
+      const h = heights[i] ?? 0;
       events.push({
         h,
         ev: {
@@ -391,15 +394,18 @@ export class Viewer {
       const first = limb.commits[0];
       const idx = first ? tree.indexOf.get(first) : undefined;
       if (idx === undefined) continue;
-      events.push({ h: heights?.[idx] ?? 0, ev: { kind: 'limb', depth: limb.depth } });
+      events.push({ h: heights[idx] ?? 0, ev: { kind: 'limb', depth: limb.depth } });
     }
 
-    for (const r of this.current?.rings ?? []) {
+    for (const r of result.rings) {
       events.push({ h: r.t, ev: { kind: 'ring', major: r.major } });
     }
 
-    const minorCount = (this.current?.rings ?? []).filter((r) => !r.major).length;
+    const minorCount = result.rings.filter((r) => !r.major).length;
     this.sonifier.load(events, minorCount > 24);
+    // Streamed pages rebuild the score mid-growth. Seek to where growth has
+    // already reached, or everything below the cursor fires at once as a burst.
+    this.sonifier.reset(this.state.growth);
   }
 
   /* ---------------------------------------------------------------------- */
