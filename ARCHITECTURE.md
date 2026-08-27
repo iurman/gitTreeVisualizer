@@ -296,6 +296,28 @@ A canvas holds exactly one kind of context for its whole life, so the swap
 bumps a generation counter, React hands back a fresh `<canvas>`, and the normal
 mount path runs again.
 
+### The worker is optional as well
+
+The renderer is not the only thing a browser can decline. Layout runs on a
+module worker, and module workers only reached Firefox in 114 — years after
+WebGL 2 — so for a while the *narrowest* requirement in this application was
+not the one the two renderers were built for. A content-security policy can
+forbid workers outright, and a script can simply fail to fetch.
+
+That case used to fail silently and terminally: nothing resolved the ready
+promise, every layout awaited forever, and the seed screen sat there for good
+with nothing in the console — the exact failure mode the renderer fallback
+exists to prevent. `LayoutEngine` is now the whole of what the worker does,
+with no reference to workers in it, so `LayoutClient` can run it on the main
+thread instead. It falls through on a constructor throw, on `onerror`, and on a
+four-second timeout for the failures that produce no event at all. Growth is
+choppy on a large repository and a badge says so.
+
+With both fallbacks, the floor is a canvas plus the build target: ES2022 and ES
+modules, which is Chrome and Edge 94, Firefox 93, Safari 15.4. `color-mix()`
+below Chrome 111 / Firefox 113 / Safari 16.2 costs some panel translucency and
+nothing else.
+
 ### One picture, two ways of drawing it
 
 Both backends draw into the same 480×270 grid and quantize to the same

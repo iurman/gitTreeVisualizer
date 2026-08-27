@@ -173,6 +173,14 @@ export function Badges() {
           gpu context lost
         </span>
       ) : null}
+      {s.layoutOnMainThread ? (
+        <span
+          className="badge mono"
+          title="This browser would not give the page a worker thread, so layout runs alongside the interface. The tree is the same; the growth animation is less smooth."
+        >
+          single thread
+        </span>
+      ) : null}
       {/* Only worth saying when it is not the usual path. A reader on the
           software renderer is usually one browser setting away from the fast
           one, and the note is the only way they would ever find out. */}

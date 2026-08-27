@@ -1,23 +1,13 @@
 /// <reference lib="webworker" />
-import {
-  buildDirectoryTopology,
-  buildTopology,
-  computeLens,
-  layout,
-  type LayoutMode,
-  type LayoutOptions,
-  type LensName,
-  type RepoSnapshot,
-  type TreeStructure,
-} from '@gittree/core';
+import type { LayoutMode, LayoutOptions, LensName, RepoSnapshot } from '@gittree/core';
+import { LayoutEngine, layoutTransferables, lensTransferables } from './layoutEngine.js';
 
 /* -------------------------------------------------------------------------- */
 /* Layout worker                                                               */
 /*                                                                            */
-/* Layout is pure, so putting it on a worker is trivial and the main thread    */
-/* never computes a position. The worker owns its own copy of the tree, built  */
-/* from the same snapshot: topology inference is deterministic, so the two     */
-/* copies are identical without shipping a large Map across the boundary.      */
+/* A postMessage wrapper around LayoutEngine and nothing else. Everything that */
+/* actually computes lives in the engine, because the client runs the same     */
+/* code on the main thread when a worker cannot be had.                        */
 /* -------------------------------------------------------------------------- */
 
 type InMessage =
@@ -25,22 +15,22 @@ type InMessage =
   | { type: 'layout'; id: number; mode: LayoutMode; opts: LayoutOptions }
   | { type: 'lens'; id: number; lens: LensName };
 
-let tree: TreeStructure | null = null;
+const engine = new LayoutEngine();
+const post = (msg: object, transfer?: ArrayBufferLike[]) =>
+  (self as unknown as Worker).postMessage(msg, (transfer ?? []) as Transferable[]);
 
 self.onmessage = (e: MessageEvent<InMessage>) => {
   const msg = e.data;
 
   if (msg.type === 'snapshot') {
-    tree = msg.directory ? buildDirectoryTopology(msg.snapshot) : buildTopology(msg.snapshot);
-    (self as unknown as Worker).postMessage({ type: 'ready', commits: tree.order.length });
+    post({ type: 'ready', commits: engine.setSnapshot(msg.snapshot, msg.directory) });
     return;
   }
 
-  if (!tree) return;
-
   if (msg.type === 'layout') {
-    const r = layout(tree, msg.mode, msg.opts);
-    (self as unknown as Worker).postMessage(
+    const r = engine.layout(msg.mode, msg.opts);
+    if (!r) return;
+    post(
       {
         type: 'layout',
         id: msg.id,
@@ -56,22 +46,15 @@ self.onmessage = (e: MessageEvent<InMessage>) => {
         cutCommits: r.cutCommits,
         bounds: r.bounds,
       },
-      [
-        r.leafPositions.buffer,
-        r.leafScales.buffer,
-        r.leafSizes.buffer,
-        r.leafHeights.buffer,
-        r.limbVertices.buffer,
-        r.limbRadii.buffer,
-        r.limbVisible.buffer,
-      ],
+      layoutTransferables(r),
     );
     return;
   }
 
   if (msg.type === 'lens') {
-    const a = computeLens(tree, msg.lens);
-    (self as unknown as Worker).postMessage(
+    const a = engine.lens(msg.lens);
+    if (!a) return;
+    post(
       {
         type: 'lens',
         id: msg.id,
@@ -81,7 +64,7 @@ self.onmessage = (e: MessageEvent<InMessage>) => {
         falling: a.falling,
         legend: a.legend,
       },
-      [a.family.buffer, a.tone.buffer, a.emphasis.buffer, a.falling.buffer],
+      lensTransferables(a),
     );
   }
 };

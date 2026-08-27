@@ -83,6 +83,8 @@ export type ViewerState = {
   rendererGeneration: number;
   /** The GPU context is gone and we are waiting to see whether it comes back. */
   contextLost: boolean;
+  /** Layout is running on the main thread because no worker could be had. */
+  layoutOnMainThread: boolean;
   fps: number;
 };
 
@@ -167,11 +169,13 @@ export class Viewer {
     rendererFailed: false,
     rendererGeneration: 0,
     contextLost: false,
+    layoutOnMainThread: false,
     fps: 60,
   };
 
   constructor() {
     this.snapshotCache = this.state;
+    this.layoutClient.observeFallback(() => this.set({ layoutOnMainThread: true }));
     const stored = readStored();
     this.state = { ...this.state, muted: stored.muted, volume: stored.volume };
     this.sound.setMuted(stored.muted);

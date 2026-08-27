@@ -219,6 +219,26 @@ under memory pressure, and a driver reset does on the desktop — the tree comes
 back when the context does. If it does not come back, the software renderer
 takes over rather than leaving a frozen canvas.
 
+Layout runs on a worker thread, and that is optional too. Module workers only
+reached Firefox in 114, and a content-security policy can forbid them outright;
+when one cannot be started the same layout code runs on the main thread
+instead. Growth gets choppy on a large repository and a badge says so. It draws
+the tree.
+
+**The floor.** With both fallbacks in place, what is actually required is a
+canvas and a browser new enough for the build target: **ES2022 and ES modules,
+which is Chrome and Edge 94, Firefox 93, Safari 15.4** — early 2022. Below
+Chrome 111 / Firefox 113 / Safari 16.2 the CSS `color-mix()` used for panel
+backgrounds is ignored, so some chrome loses its translucency; the tree is
+unaffected. Older than the floor and the page will not boot at all, which is a
+bundler target and could be lowered if it ever mattered.
+
+Verified by driving the real application: WebGL disabled, the worker blocked,
+both at once, and the graphics context taken away mid-session and not given
+back. All of that testing was in Chromium — the fallbacks are feature-detected
+rather than version-detected, so they do not depend on which engine is running,
+but Firefox and Safari have not been driven directly.
+
 ---
 
 ## Speed
